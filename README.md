@@ -7,7 +7,7 @@
 
 ![Zuvio Bot GUI Screenshot](assets/app_screenshot.png)
 
-本專案是一款專為 Zuvio 點名系統設計的自動簽到助手。支援**現代化 GUI 圖形介面**與**輕量 CLI 終端機模式**，採用多執行緒設計與強健的瀏覽器自動化技術，並支援 GPS 定位模擬與 Telegram 即時通知。
+本專案是一款專為 Zuvio 點名系統設計的自動簽到助手。支援**現代化 GUI 圖形介面**與**輕量 CLI 終端機模式**，採用多執行緒設計與強健的瀏覽器自動化技術，並支援 GPS 定位模擬與 LINE 即時通知。
 
 ---
 
@@ -22,8 +22,10 @@
 *   **🏫 動態課程篩選監控**
     *   登入後自動抓取所有就讀課程，並在 GUI 畫面上渲染為核取方塊。
     *   使用者可即時剔除不需點名的課程，後端監控線程將自動同步篩選，節省網路頻寬與 CPU 資源。
-*   **🔔 Telegram Bot 即時推播**
-    *   整合 Telegram Bot API，在**點名成功**、**程式啟動**或**發生異常**時，即時發送手機推播通知與蜂鳴器警報。
+*   **🔔 LINE 即時推播**
+    *   整合 LINE Messaging API，**點名成功**時立即推播；**每天第一次啟動監控**時發一則確認；**持續異常**（Chrome 反覆卡住、登入一直失敗）時提醒，同類異常每小時最多一則，避免用光免費方案的每月訊息額度。
+*   **🛡️ 防卡死自動復原**
+    *   頁面最多載入 20 秒、與瀏覽器的每次溝通最多 60 秒；偵測到 Chrome 卡死會自動強制關閉、重開並重新登入，不會整天白跑。
 *   **⚡ 線程安全與防卡死設計**
     *   將 Selenium 瀏覽器自動化與 GUI 主線程完全分離。
     *   使用 `queue.Queue` 進行線程安全的日誌與狀態更新，防止介面在執行 IO 密集任務時凍結。
@@ -83,7 +85,19 @@ python Zuvio.py
 python Zuvio.py --cli
 ```
 
-*   若無設定檔，系統會引導填寫帳密與 Telegram 配置，隨後進入無頭瀏覽器監控循環。
+*   若無設定檔，系統會引導填寫帳密與 LINE 通知配置，隨後進入無頭瀏覽器監控循環。
+
+### 🔔 LINE 通知設定
+
+> LINE Notify 已於 2025/3/31 停止服務，本專案改用 **LINE Messaging API**（免費建立官方帳號即可）。
+
+1. 到 [LINE Developers](https://developers.line.biz/) 用你的 LINE 帳號登入，建立一個 Provider，再建立 **Messaging API** channel（會順便建立一個 LINE 官方帳號）。
+2. **Channel access token**：channel 的「Messaging API」分頁最下方 → Channel access token (long-lived) → **Issue**，複製下來。
+3. **User ID**：channel 的「Basic settings」分頁最下方 →「**Your user ID**」（U 開頭 33 碼）。
+4. 用手機掃「Messaging API」分頁上的 QR code，**把官方帳號加為好友**（沒加好友會推播失敗）。
+5. 在 GUI 的「LINE 通知設定」貼上兩個值、開啟開關，按「測試傳送通知」確認手機有收到。
+
+免費方案每月可發的訊息數有限，因此程式只在重要事件發送（見上方「LINE 即時推播」說明）。
 
 ---
 

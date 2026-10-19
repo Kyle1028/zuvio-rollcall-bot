@@ -6,12 +6,15 @@ import sys
 import time
 import traceback
 import json
+import urllib.error
 import urllib.request
 import queue
 import threading
 import argparse
 import re
+import subprocess
 
+import urllib3
 from selenium import webdriver
 import selenium.webdriver.chrome.webdriver
 from selenium.webdriver.common.by import By
@@ -64,6 +67,17 @@ SCAN_AFTER_HIT_DELAY  = 2     # 點名成功或發生例外後的間隔
 SCAN_ROUND_MIN_DELAY  = 10    # 每掃完一輪課程後的最短休息
 SCAN_ROUND_MAX_DELAY  = 20    # 每掃完一輪課程後的最長休息
 
+# 防卡死設定（秒）
+PAGE_LOAD_TIMEOUT      = 20   # 單一頁面最長載入時間；超過就停止載入、用已載入的內容判斷
+DRIVER_COMMAND_TIMEOUT = 60   # 與 chromedriver 單次溝通的上限；超過視為 Chrome 卡死（Selenium 預設 120）
+DRIVER_QUIT_TIMEOUT    = 15   # 正常關閉 Chrome 的等待上限；超過就強制結束程序
+LOGIN_TIMEOUT          = 20   # 登入後最多等這麼久確認是否進到課程頁
+
+# LINE 通知節流（免費方案每月訊息數有限，異常類通知不能洗版）
+NOTIFY_ALERT_COOLDOWN  = 3600 # 同類異常通知的最短間隔（秒）
+DRIVER_RESTART_ALERT   = 3    # 30 分鐘內 Chrome 重開達此次數才發通知
+LOGIN_FAIL_ALERT       = 3    # 連續登入失敗達此次數才發通知
+
 # GUI 主題色票（集中管理，方便日後統一調整或做淺色主題）
 COLOR_ACCENT  = "#1F6AA5"     # 標題／主按鈕強調色
 COLOR_DIVIDER = "#3A3A3A"     # 分隔線／次要 hover 色
@@ -94,29 +108,46 @@ def log(msg: str, level: str = 'info'):
 
 
 # ──────────────────────────────────────────────
-# [3] Telegram 通知模組
+# [3] LINE 通知模組（LINE Messaging API）
 # ──────────────────────────────────────────────
-def send_telegram(bot_token: str, chat_id: str, message: str) -> bool:
-    """透過 Telegram Bot API 傳送純文字訊息。"""
+# LINE Notify 已於 2025/3/31 停止服務，因此改用 Messaging API 的 push message：
+#   - Channel access token：LINE Developers 後台 → 你的 Messaging API channel →
+#     Messaging API 分頁 → Channel access token (long-lived) → Issue
+#   - User ID：同一個 channel 的 Basic settings 分頁最下方「Your user ID」（U 開頭 33 碼）
+#   - 記得用手機加這個官方帳號為好友，否則推播會失敗
+# 免費方案每月可發訊息數有限，所以只在重要事件發送（見 ZuvioBot.notify 的節流）。
+LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
+
+
+def send_line(channel_token: str, user_id: str, message: str) -> bool:
+    """透過 LINE Messaging API 推播一則純文字訊息給指定使用者。"""
     try:
-        url     = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        payload = json.dumps({"chat_id": chat_id, "text": message}).encode("utf-8")
-        req     = urllib.request.Request(
-            url, data=payload,
-            headers={"Content-Type": "application/json"},
+        payload = json.dumps({
+            "to": user_id,
+            "messages": [{"type": "text", "text": message[:5000]}],
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            LINE_PUSH_URL, data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {channel_token}",
+            },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            result = json.loads(resp.read().decode())
-            return result.get("ok", False)
+            return 200 <= resp.status < 300
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:200]
+        log(f"  [LINE 發送失敗] HTTP {e.code}：{detail}", level='warning')
+        return False
     except Exception as e:
-        log(f"  [Telegram 發送失敗] {e}", level='warning')
+        log(f"  [LINE 發送失敗] {e}", level='warning')
         return False
 
 
-def verify_telegram(bot_token: str, chat_id: str) -> bool:
-    msg = "✅ Zuvio 點名助手已啟動！\n通知功能設定成功，點名成功時將會通知您。"
-    return send_telegram(bot_token, chat_id, msg)
+def verify_line(channel_token: str, user_id: str) -> bool:
+    msg = "✅ Zuvio 點名助手已連上 LINE！\n點名成功時會在這裡通知你。"
+    return send_line(channel_token, user_id, msg)
 
 
 # ──────────────────────────────────────────────
@@ -245,15 +276,81 @@ def build_driver(lat: float = None, lon: float = None) -> webdriver.Chrome:
             "accuracy": 100
         })
 
+    # 防卡死：頁面最多等 PAGE_LOAD_TIMEOUT 秒；與 chromedriver 的每次溝通最多等
+    # DRIVER_COMMAND_TIMEOUT 秒（Selenium 預設 120 秒，Chrome 卡死時每個動作都要白等兩分鐘）
+    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+    client_config = getattr(driver.command_executor, '_client_config', None)
+    if client_config is not None:
+        client_config.timeout = DRIVER_COMMAND_TIMEOUT
+
     return driver
 
 
-def quit_driver(driver: webdriver.Chrome):
-    """安全地關閉 driver，忽略已關閉的情況。"""
+class DriverUnresponsive(Exception):
+    """Chrome / chromedriver 已沒有回應，必須關掉重開。"""
+
+
+# 出現在 WebDriverException 訊息中、代表瀏覽器已經掛掉的關鍵字
+_DEAD_DRIVER_HINTS = (
+    "invalid session id", "chrome not reachable", "disconnected",
+    "no such window", "session deleted", "target window already closed",
+)
+
+
+def short_err(e: BaseException, limit: int = 150) -> str:
+    """取例外訊息的第一行（Selenium 的訊息常夾帶很長的 stacktrace）。"""
+    lines = str(e).strip().splitlines()
+    return (lines[0] if lines else type(e).__name__)[:limit]
+
+
+def is_driver_dead(e: BaseException) -> bool:
+    """判斷例外是否代表 Chrome 已卡死／斷線（而不是單一頁面的問題）。"""
+    # 與 chromedriver 的本機連線逾時或斷線（例：localhost:xxxxx Read timed out）
+    if isinstance(e, (urllib3.exceptions.HTTPError, ConnectionError, TimeoutError)):
+        return True
+    if isinstance(e, WebDriverException):
+        msg = str(e).lower()
+        return any(hint in msg for hint in _DEAD_DRIVER_HINTS)
+    return False
+
+
+def _kill_driver_process(driver: webdriver.Chrome):
+    """強制結束 chromedriver 及其底下的 Chrome 程序。"""
+    proc = getattr(getattr(driver, 'service', None), 'process', None)
+    if proc is None or proc.poll() is not None:
+        return
     try:
-        driver.quit()
+        if os.name == 'nt':
+            # /T 連同子程序（Chrome）一起結束；CREATE_NO_WINDOW 避免 --noconsole 的 exe 閃出黑窗
+            subprocess.run(
+                ['taskkill', '/PID', str(proc.pid), '/T', '/F'],
+                capture_output=True, timeout=15, creationflags=0x08000000,
+            )
+        else:
+            subprocess.run(['pkill', '-KILL', '-P', str(proc.pid)], capture_output=True, timeout=15)
+            proc.kill()
     except Exception:
         pass
+
+
+def quit_driver(driver: webdriver.Chrome):
+    """安全地關閉 driver。
+
+    Chrome 卡死時 driver.quit() 本身也會卡住，所以在背景執行緒呼叫、最多等
+    DRIVER_QUIT_TIMEOUT 秒；逾時就直接強制結束程序，避免殘留的 Chrome 吃記憶體。
+    """
+    def _quit():
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_quit, daemon=True)
+    t.start()
+    t.join(DRIVER_QUIT_TIMEOUT)
+    if t.is_alive():
+        log("[驅動] Chrome 未在時限內關閉，強制結束程序。", level='warning')
+        _kill_driver_process(driver)
 
 
 # ──────────────────────────────────────────────
@@ -262,8 +359,12 @@ def quit_driver(driver: webdriver.Chrome):
 class ZuvioBot:
     def __init__(self):
         self.config_file = CONFIG_FILE_PATH
-        self.tg_token    = None
-        self.tg_chat_id  = None
+        self.line_token   = None
+        self.line_user_id = None
+        # 通知節流狀態：類別 → 上次發送時間；以及「今天是否已發過啟動通知」
+        self._notify_last = {}
+        self._startup_notified_date = None
+        self._page_timeout_warned = False
         self.driver      = None
         self.wait        = None
         self.active_start = 8
@@ -313,34 +414,35 @@ class ZuvioBot:
         # 密碼不做 strip，避免把使用者密碼中合法的前後空白去掉
         password = input("Zuvio 密碼         : ")
 
-        print("\n── Telegram 通知設定 ──")
+        print("\n── LINE 通知設定（LINE Messaging API）──")
         print("  如果不想設定，直接按 Enter 略過。")
-        print("  取得 Bot Token：找 @BotFather 建立 Bot")
-        print("  取得 Chat ID  ：找 @userinfobot 查詢")
+        print("  Channel access token：LINE Developers → 你的 channel → Messaging API 分頁 → Issue")
+        print("  User ID             ：同一個 channel 的 Basic settings 最下方「Your user ID」")
+        print("  並記得用手機把這個官方帳號加為好友。")
         print("-" * 40)
 
-        tg_token   = input("Bot Token（例如 123456:ABC-DEF…）: ").strip()
-        tg_chat_id = input("Chat ID  （例如 123456789）       : ").strip()
+        line_token   = input("Channel access token: ").strip()
+        line_user_id = input("User ID（U 開頭）    : ").strip()
 
         cfg = {
             'user': email, 'pass': password,
             'active_start': 8, 'active_end': 18,
-            'tg_token': tg_token, 'tg_chat_id': tg_chat_id,
+            'line_token': line_token, 'line_user_id': line_user_id,
         }
 
-        if tg_token and tg_chat_id:
-            print("\n正在驗證 Telegram 設定...")
-            if verify_telegram(tg_token, tg_chat_id):
-                print(">>> [成功] Telegram 通知設定正確！請確認是否收到測試訊息。")
-                cfg['tg_enabled'] = True
+        if line_token and line_user_id:
+            print("\n正在驗證 LINE 設定...")
+            if verify_line(line_token, line_user_id):
+                print(">>> [成功] LINE 通知設定正確！請確認手機是否收到測試訊息。")
+                cfg['line_enabled'] = True
             else:
-                print(">>> [警告] Telegram 驗證失敗，請確認 Token 與 Chat ID。")
+                print(">>> [警告] LINE 驗證失敗，請確認 token、User ID，以及是否已加官方帳號為好友。")
                 if input("是否重新輸入？(y/N): ").strip().lower() == 'y':
                     return self.setup_config()
-                cfg['tg_enabled'] = False
+                cfg['line_enabled'] = False
         else:
-            print(">>> [略過] 未設定 Telegram，將不發送通知。")
-            cfg['tg_enabled'] = False
+            print(">>> [略過] 未設定 LINE，將不發送通知。")
+            cfg['line_enabled'] = False
 
         self.save_config(cfg)
 
@@ -353,6 +455,9 @@ class ZuvioBot:
         檔案系統上是原子操作，可避免 GUI 主執行緒與背景監控執行緒同時讀寫時，
         讀到寫入到一半的半成品 JSON 而造成設定毀損。
         """
+        # 已改用 LINE：順手清掉舊版遺留的 Telegram 欄位
+        for legacy_key in ('tg_token', 'tg_chat_id', 'tg_enabled'):
+            cfg.pop(legacy_key, None)
         tmp_path = self.config_file + '.tmp'
         with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -370,26 +475,26 @@ class ZuvioBot:
 
         伺服器上建議把機密放在環境變數（例如 systemd 的 EnvironmentFile），
         而不要把密碼明文寫進 settings.json。有設定對應的環境變數時就以它為準：
-          ZUVIO_USER / ZUVIO_PASS          → 帳號、密碼
-          ZUVIO_TG_TOKEN / ZUVIO_TG_CHAT_ID → Telegram（兩者皆有時自動啟用通知）
+          ZUVIO_USER / ZUVIO_PASS               → 帳號、密碼
+          ZUVIO_LINE_TOKEN / ZUVIO_LINE_USER_ID → LINE（兩者皆有時自動啟用通知）
         在一般桌面（GUI）使用時不設這些變數，行為與原本完全相同。
         """
         env_user = os.environ.get('ZUVIO_USER')
         env_pass = os.environ.get('ZUVIO_PASS')
-        env_token = os.environ.get('ZUVIO_TG_TOKEN')
-        env_chat = os.environ.get('ZUVIO_TG_CHAT_ID')
+        env_token = os.environ.get('ZUVIO_LINE_TOKEN')
+        env_line_user = os.environ.get('ZUVIO_LINE_USER_ID')
 
         if env_user is not None:
             cfg['user'] = env_user
         if env_pass is not None:
             cfg['pass'] = env_pass
         if env_token is not None:
-            cfg['tg_token'] = env_token
-        if env_chat is not None:
-            cfg['tg_chat_id'] = env_chat
-        # 兩個 Telegram 欄位都有值時，自動視為啟用通知
-        if cfg.get('tg_token') and cfg.get('tg_chat_id') and (env_token or env_chat):
-            cfg['tg_enabled'] = True
+            cfg['line_token'] = env_token
+        if env_line_user is not None:
+            cfg['line_user_id'] = env_line_user
+        # 兩個 LINE 欄位都有值時，自動視為啟用通知
+        if cfg.get('line_token') and cfg.get('line_user_id') and (env_token or env_line_user):
+            cfg['line_enabled'] = True
         return cfg
 
     def load_config(self) -> dict:
@@ -418,9 +523,9 @@ class ZuvioBot:
                 'pass': '',
                 'active_start': 8,
                 'active_end': 18,
-                'tg_token': '',
-                'tg_chat_id': '',
-                'tg_enabled': False
+                'line_token': '',
+                'line_user_id': '',
+                'line_enabled': False
             }
 
         return self._apply_env_overrides(cfg)
@@ -498,12 +603,27 @@ class ZuvioBot:
             print()
 
     # ── 通知 ────────────────────────────────────
-    def notify(self, message: str):
-        if self.tg_token and self.tg_chat_id:
-            send_telegram(self.tg_token, self.tg_chat_id, message)
+    def notify(self, message: str, category: str = None) -> bool:
+        """發送 LINE 通知。
+
+        指定 category 時會節流：同一類別在 NOTIFY_ALERT_COOLDOWN 秒內只發一次，
+        避免異常狀況把免費方案的每月訊息額度洗光。點名成功等重要訊息不帶 category。
+        """
+        if not (self.line_token and self.line_user_id):
+            return False
+        if category:
+            now = time.time()
+            if now - self._notify_last.get(category, 0) < NOTIFY_ALERT_COOLDOWN:
+                return False
+            self._notify_last[category] = now
+        return send_line(self.line_token, self.line_user_id, message)
 
     def notify_startup(self, course_names: list):
-        if not (self.tg_token and self.tg_chat_id):
+        """啟動通知：一天只發一次（Chrome 重開、重新登入時不重複發）。"""
+        if not (self.line_token and self.line_user_id):
+            return
+        today = datetime.date.today()
+        if self._startup_notified_date == today:
             return
         now_str          = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         course_list_text = '\n'.join(f"  • {name}" for name in course_names)
@@ -515,14 +635,32 @@ class ZuvioBot:
             f"監控時段：每日 {self.active_start:02d}:00 – {self.active_end:02d}:00\n"
             f"點名開放時將自動簽到並通知您。"
         )
-        if send_telegram(self.tg_token, self.tg_chat_id, msg):
-            log(">>> [Telegram] 啟動通知已發送。")
+        if send_line(self.line_token, self.line_user_id, msg):
+            self._startup_notified_date = today
+            log(">>> [LINE] 啟動通知已發送。")
         else:
-            log(">>> [Telegram] 啟動通知發送失敗。", level='warning')
+            log(">>> [LINE] 啟動通知發送失敗。", level='warning')
+
+    # ── 開啟頁面（防卡死）──────────────────────────
+    def _open_page(self, url: str):
+        """開啟頁面；超過 PAGE_LOAD_TIMEOUT 仍沒載完就停止載入，用已載入的內容繼續。
+
+        有些頁面的資源一直載不完，會讓 driver.get() 卡住；點名狀態通常早就渲染好了，
+        所以逾時後呼叫 window.stop() 停止載入即可，不必整頁放棄。
+        Chrome 若已卡死，window.stop() 也會失敗並丟出例外，交給呼叫端判斷是否重開。
+        """
+        try:
+            self.driver.get(url)
+        except TimeoutException:
+            self.driver.execute_script("window.stop();")
+            if not self._page_timeout_warned:
+                log(f"[提醒] 頁面載入超過 {PAGE_LOAD_TIMEOUT} 秒，已停止載入並以目前內容判斷"
+                    "（此提醒每次啟動只顯示一次）。", level='warning')
+                self._page_timeout_warned = True
 
     # ── 登入 ────────────────────────────────────
     def login(self, email: str, password: str):
-        self.driver.get("https://irs.zuvio.com.tw/")
+        self._open_page("https://irs.zuvio.com.tw/")
         self.wait.until(EC.presence_of_element_located((By.ID, "email"))).send_keys(email)
         self.driver.find_element(By.ID, "password").send_keys(password)
         self.driver.execute_script(
@@ -530,14 +668,23 @@ class ZuvioBot:
             self.driver.find_element(By.ID, "login-btn")
         )
 
+        # 不再固定等 5 秒：每秒檢查一次，一進到課程頁就算成功，最多等 LOGIN_TIMEOUT 秒
         log("正在驗證登入狀態...")
-        self.sleep_interruptible(5)
+        logged_in = False
+        deadline = time.time() + LOGIN_TIMEOUT
+        while time.time() < deadline:
+            source = self.driver.page_source
+            if "全部課程" in source or "我的課表" in source:
+                logged_in = True
+                break
+            if self.sleep_interruptible(1):
+                return
 
-        if "全部課程" in self.driver.page_source or "我的課表" in self.driver.page_source:
+        if logged_in:
             log(">>> [成功] 登入成功！")
         else:
             log(">>> [失敗] 登入失敗，可能是帳密錯誤或觸發驗證碼。", level='error')
-            # 不再刪除整個設定檔（會連 Telegram／時段／GPS／課程勾選一起清掉）。
+            # 不再刪除整個設定檔（會連 LINE／時段／GPS／課程勾選一起清掉）。
             # 只提示使用者修正帳密後重新啟動；設定檔原封保留。
             if not self.status_cb:
                 log(
@@ -555,7 +702,7 @@ class ZuvioBot:
         return any(kw and kw in name for kw in self.course_exclude_keywords)
 
     def get_courses(self) -> dict:
-        self.driver.get("https://irs.zuvio.com.tw/student5/irs/index")
+        self._open_page("https://irs.zuvio.com.tw/student5/irs/index")
         elements = self.wait.until(EC.presence_of_all_elements_located(
             (By.CLASS_NAME, 'i-m-p-c-a-c-l-c-b-t-course-name')
         ))
@@ -585,7 +732,7 @@ class ZuvioBot:
                     continue
 
                 try:
-                    self.driver.get(URI.format(c_id))
+                    self._open_page(URI.format(c_id))
 
                     if "簽到開放中" not in self.driver.page_source:
                         consecutive_driver_errors = 0
@@ -623,30 +770,23 @@ class ZuvioBot:
                     )
 
                 except WebDriverException as e:
+                    # Chrome 已卡死／斷線：不要再一門一門白等，交給 monitor_loop 重開
+                    if is_driver_dead(e):
+                        raise DriverUnresponsive(f"{c_name}：{short_err(e)}") from e
                     consecutive_driver_errors += 1
                     log(
                         f"[嚴重] WebDriver 錯誤（第 {consecutive_driver_errors} 次）"
-                        f"｜課程：{c_name}｜{e}",
+                        f"｜課程：{c_name}｜{short_err(e, 200)}",
                         level='error'
                     )
-                    self.notify(
-                        f"⚠️ Zuvio Bot 驅動錯誤\n課程：{c_name}\n原因：{str(e)[:200]}"
-                    )
-
                     if consecutive_driver_errors >= 5:
-                        log("[致命] 連續 5 次驅動錯誤，提前結束本日監控。", level='critical')
-                        self.notify(
-                            "🛑 Zuvio Bot 本日監控中止\n"
-                            "連續驅動錯誤次數過多，明日將自動重啟。"
-                        )
-                        return
+                        raise DriverUnresponsive("連續 5 次 WebDriver 錯誤") from e
 
                 except Exception as e:
+                    if is_driver_dead(e):
+                        raise DriverUnresponsive(f"{c_name}：{short_err(e)}") from e
                     tb = traceback.format_exc()
                     log(f"[未知錯誤] {c_name}：{e}\n{tb}", level='error')
-                    self.notify(
-                        f"❓ Zuvio Bot 未知錯誤\n課程：{c_name}\n原因：{str(e)[:200]}"
-                    )
 
                 if self.sleep_interruptible(SCAN_AFTER_HIT_DELAY):
                     return
@@ -667,6 +807,10 @@ class ZuvioBot:
         log(" Zuvio 自動點名助手 - 開始監控")
         log("=" * 45)
 
+        start_failures = 0     # 連續 Chrome 啟動失敗次數
+        login_failures = 0     # 連續登入／取課失敗次數
+        restart_times = []     # 近 30 分鐘內因卡死而重開 Chrome 的時間點
+
         while not self.stop_event.is_set():
             if not self.is_active_time():
                 self.sleep_until_next_window()
@@ -677,9 +821,17 @@ class ZuvioBot:
             self.update_status("🔵 啟動 Chrome 中...")
             try:
                 self.start_driver()
+                start_failures = 0
             except Exception as e:
-                log(f"[驅動] Chrome 啟動失敗：{e}", level='error')
+                start_failures += 1
+                log(f"[驅動] Chrome 啟動失敗（連續第 {start_failures} 次）：{short_err(e, 300)}", level='error')
                 self.update_status("⚠️ 啟動瀏覽器失敗")
+                if start_failures >= 3:
+                    self.notify(
+                        f"⚠️ Zuvio 點名助手：Chrome 已連續 {start_failures} 次啟動失敗，"
+                        "目前無法監控，請檢查電腦／主機。",
+                        category='driver',
+                    )
                 if self.sleep_interruptible(10):
                     break
                 continue
@@ -691,16 +843,25 @@ class ZuvioBot:
                 self.login(cfg['user'], cfg['pass'])
 
                 if self.stop_event.is_set():
+                    self.stop_driver()
                     break
 
                 self.update_status("🔵 載入課程清單...")
                 course_list = self.get_courses()
                 self.monitored_course_ids = cfg.get('monitored_courses', None)
                 self.update_courses(course_list)
+                login_failures = 0
 
             except Exception as e:
-                log(f"[錯誤] 登入或取得課程失敗：{e}", level='error')
+                login_failures += 1
+                log(f"[錯誤] 登入或取得課程失敗（連續第 {login_failures} 次）：{short_err(e, 300)}", level='error')
                 self.update_status("⚠️ 登入或讀取失敗")
+                if login_failures >= LOGIN_FAIL_ALERT:
+                    self.notify(
+                        f"⚠️ Zuvio 點名助手：已連續 {login_failures} 次登入失敗，"
+                        "可能是帳密錯誤或遇到驗證碼，目前沒有在監控。",
+                        category='login',
+                    )
                 self.stop_driver()
                 if self.sleep_interruptible(30):
                     break
@@ -721,7 +882,24 @@ class ZuvioBot:
 
             # 開始執行監控 session
             self.update_status("🟢 監控中")
-            self.run_session(course_list)
+            try:
+                self.run_session(course_list)
+            except DriverUnresponsive as e:
+                # Chrome 卡死：關掉（必要時強制結束）後回到迴圈開頭，重開 Chrome 並重新登入
+                now = time.time()
+                restart_times = [t for t in restart_times if now - t < 1800] + [now]
+                log(f"[驅動] Chrome 沒有回應（{e}），重新啟動瀏覽器並重新登入...", level='warning')
+                self.update_status("🔄 Chrome 卡住，重新啟動中...")
+                if len(restart_times) >= DRIVER_RESTART_ALERT:
+                    self.notify(
+                        f"⚠️ Zuvio 點名助手：30 分鐘內 Chrome 已卡住並重開 {len(restart_times)} 次，"
+                        "監控可能不穩定，請留意。",
+                        category='driver',
+                    )
+                self.stop_driver()
+                if self.sleep_interruptible(5):
+                    break
+                continue
 
             # 關閉瀏覽器，等待下一次排程
             self.stop_driver()
@@ -770,9 +948,9 @@ class ZuvioGUI(GUI_BASE_CLASS):
         self.password_var = tk.StringVar()
         self.start_hour_var = tk.StringVar(value="8")
         self.end_hour_var = tk.StringVar(value="18")
-        self.tg_token_var = tk.StringVar()
-        self.tg_chat_id_var = tk.StringVar()
-        self.tg_enabled_var = tk.BooleanVar(value=False)
+        self.line_token_var = tk.StringVar()
+        self.line_user_id_var = tk.StringVar()
+        self.line_enabled_var = tk.BooleanVar(value=False)
         self.gps_enabled_var = tk.BooleanVar(value=False)
         self.gps_str_var = tk.StringVar()
         self.status_var = tk.StringVar(value="🔴 已停止")
@@ -886,21 +1064,28 @@ class ZuvioGUI(GUI_BASE_CLASS):
         self.divider = ctk.CTkFrame(self.left_frame, height=2, fg_color=COLOR_DIVIDER)
         self.divider.pack(fill="x", padx=10, pady=15)
         
-        # Telegram 設定
-        self.tg_lbl = ctk.CTkLabel(self.left_frame, text="Telegram 通知設定", font=ctk.CTkFont(size=14, weight="bold"), text_color=COLOR_ACCENT)
-        self.tg_lbl.pack(anchor="w", padx=10, pady=(5, 5))
-        
-        self.tg_switch = ctk.CTkSwitch(self.left_frame, text="啟用 Telegram 通知", variable=self.tg_enabled_var, font=ctk.CTkFont(size=12))
-        self.tg_switch.pack(anchor="w", padx=10, pady=5)
-        
-        self.tg_token_entry = ctk.CTkEntry(self.left_frame, placeholder_text="Bot Token (例如 123456:ABC...)", textvariable=self.tg_token_var, width=240)
-        self.tg_token_entry.pack(anchor="w", padx=10, pady=5)
-        
-        self.tg_chat_entry = ctk.CTkEntry(self.left_frame, placeholder_text="Chat ID (例如 123456789)", textvariable=self.tg_chat_id_var, width=240)
-        self.tg_chat_entry.pack(anchor="w", padx=10, pady=5)
-        
-        self.tg_test_btn = ctk.CTkButton(self.left_frame, text="測試傳送通知", command=self.test_telegram_settings, fg_color="#2B2B2B", hover_color=COLOR_DIVIDER, font=ctk.CTkFont(size=12))
-        self.tg_test_btn.pack(anchor="w", padx=10, pady=(8, 15))
+        # LINE 通知設定（LINE Messaging API）
+        self.line_lbl = ctk.CTkLabel(self.left_frame, text="LINE 通知設定", font=ctk.CTkFont(size=14, weight="bold"), text_color=COLOR_ACCENT)
+        self.line_lbl.pack(anchor="w", padx=10, pady=(5, 5))
+
+        self.line_switch = ctk.CTkSwitch(self.left_frame, text="啟用 LINE 通知", variable=self.line_enabled_var, font=ctk.CTkFont(size=12))
+        self.line_switch.pack(anchor="w", padx=10, pady=5)
+
+        self.line_token_entry = ctk.CTkEntry(self.left_frame, placeholder_text="Channel access token", textvariable=self.line_token_var, show="*", width=240)
+        self.line_token_entry.pack(anchor="w", padx=10, pady=5)
+
+        self.line_user_entry = ctk.CTkEntry(self.left_frame, placeholder_text="User ID (U 開頭 33 碼)", textvariable=self.line_user_id_var, width=240)
+        self.line_user_entry.pack(anchor="w", padx=10, pady=5)
+
+        self.line_hint = ctk.CTkLabel(
+            self.left_frame,
+            text="※ 兩者皆在 LINE Developers 後台取得，\n   並需先用手機加官方帳號為好友。",
+            font=ctk.CTkFont(size=11), text_color="grey", justify="left",
+        )
+        self.line_hint.pack(anchor="w", padx=10, pady=(0, 2))
+
+        self.line_test_btn = ctk.CTkButton(self.left_frame, text="測試傳送通知", command=self.test_line_settings, fg_color="#2B2B2B", hover_color=COLOR_DIVIDER, font=ctk.CTkFont(size=12))
+        self.line_test_btn.pack(anchor="w", padx=10, pady=(8, 15))
         
         # 儲存按鈕
         self.save_btn = ctk.CTkButton(self.left_frame, text="儲存所有設定", command=self.save_settings_from_ui, fg_color=COLOR_ACCENT, font=ctk.CTkFont(weight="bold"))
@@ -979,9 +1164,9 @@ class ZuvioGUI(GUI_BASE_CLASS):
         self.password_var.set(cfg.get('pass', ''))
         self.start_hour_var.set(str(cfg.get('active_start', 8)))
         self.end_hour_var.set(str(cfg.get('active_end', 18)))
-        self.tg_token_var.set(cfg.get('tg_token', ''))
-        self.tg_chat_id_var.set(cfg.get('tg_chat_id', ''))
-        self.tg_enabled_var.set(cfg.get('tg_enabled', False))
+        self.line_token_var.set(cfg.get('line_token', ''))
+        self.line_user_id_var.set(cfg.get('line_user_id', ''))
+        self.line_enabled_var.set(cfg.get('line_enabled', False))
         self.gps_enabled_var.set(cfg.get('gps_enabled', False))
         self.gps_str_var.set(cfg.get('gps_str', ''))
         
@@ -994,9 +1179,9 @@ class ZuvioGUI(GUI_BASE_CLASS):
         password = self.password_var.get()  # 不 strip，保留密碼中合法的前後空白
         start_hour = int(self.start_hour_var.get())
         end_hour = int(self.end_hour_var.get())
-        tg_token = self.tg_token_var.get().strip()
-        tg_chat_id = self.tg_chat_id_var.get().strip()
-        tg_enabled = self.tg_enabled_var.get()
+        line_token = self.line_token_var.get().strip()
+        line_user_id = self.line_user_id_var.get().strip()
+        line_enabled = self.line_enabled_var.get()
         gps_enabled = self.gps_enabled_var.get()
         gps_str = self.gps_str_var.get().strip()
         
@@ -1019,9 +1204,9 @@ class ZuvioGUI(GUI_BASE_CLASS):
         cfg['pass'] = password
         cfg['active_start'] = start_hour
         cfg['active_end'] = end_hour
-        cfg['tg_token'] = tg_token
-        cfg['tg_chat_id'] = tg_chat_id
-        cfg['tg_enabled'] = tg_enabled
+        cfg['line_token'] = line_token
+        cfg['line_user_id'] = line_user_id
+        cfg['line_enabled'] = line_enabled
         cfg['gps_enabled'] = gps_enabled
         cfg['gps_str'] = gps_str
         
@@ -1030,35 +1215,39 @@ class ZuvioGUI(GUI_BASE_CLASS):
         # 同步至 bot 實例
         self.bot.active_start = start_hour
         self.bot.active_end = end_hour
-        self.bot.tg_token = tg_token if tg_enabled else None
-        self.bot.tg_chat_id = tg_chat_id if tg_enabled else None
-        
+        self.bot.line_token = line_token if line_enabled else None
+        self.bot.line_user_id = line_user_id if line_enabled else None
+
         if show_alert:
             messagebox.showinfo("成功", "設定已儲存成功！")
         return True
 
-    def test_telegram_settings(self):
-        token = self.tg_token_var.get().strip()
-        chat_id = self.tg_chat_id_var.get().strip()
-        if not token or not chat_id:
-            messagebox.showerror("驗證失敗", "請輸入完整的 Bot Token 與 Chat ID。")
+    def test_line_settings(self):
+        token = self.line_token_var.get().strip()
+        user_id = self.line_user_id_var.get().strip()
+        if not token or not user_id:
+            messagebox.showerror("驗證失敗", "請輸入完整的 Channel access token 與 User ID。")
             return
-            
-        self.tg_test_btn.configure(state="disabled", text="驗證中...")
-        
-        # 於背景線程執行 Telegram 測試，防止 GUI 卡死
+
+        self.line_test_btn.configure(state="disabled", text="驗證中...")
+
+        # 於背景線程執行 LINE 測試，防止 GUI 卡死
         def run_test():
-            success = verify_telegram(token, chat_id)
-            self.after(0, lambda: self.on_telegram_test_complete(success))
-            
+            success = verify_line(token, user_id)
+            self.after(0, lambda: self.on_line_test_complete(success))
+
         threading.Thread(target=run_test, daemon=True).start()
-        
-    def on_telegram_test_complete(self, success):
-        self.tg_test_btn.configure(state="normal", text="測試傳送通知")
+
+    def on_line_test_complete(self, success):
+        self.line_test_btn.configure(state="normal", text="測試傳送通知")
         if success:
-            messagebox.showinfo("成功", "Telegram 驗證成功！\n請確認您的手機是否收到測試訊息。")
+            messagebox.showinfo("成功", "LINE 驗證成功！\n請確認手機是否收到測試訊息。")
         else:
-            messagebox.showerror("失敗", "Telegram 驗證失敗。\n請檢查 Token 與 Chat ID 是否正確。")
+            messagebox.showerror(
+                "失敗",
+                "LINE 驗證失敗。\n請檢查 token 與 User ID，並確認已用手機加官方帳號為好友。\n"
+                "（詳細原因見右側運行日誌）",
+            )
 
     def clear_console(self):
         self.console_text.configure(state="normal")
@@ -1182,13 +1371,13 @@ class ZuvioGUI(GUI_BASE_CLASS):
         self.password_entry.configure(state="disabled")
         self.start_combo.configure(state="disabled")
         self.end_combo.configure(state="disabled")
-        self.tg_token_entry.configure(state="disabled")
-        self.tg_chat_entry.configure(state="disabled")
-        self.tg_switch.configure(state="disabled")
+        self.line_token_entry.configure(state="disabled")
+        self.line_user_entry.configure(state="disabled")
+        self.line_switch.configure(state="disabled")
         self.gps_switch.configure(state="disabled")
         self.gps_entry.configure(state="disabled")
         self.save_btn.configure(state="disabled")
-        self.tg_test_btn.configure(state="disabled")
+        self.line_test_btn.configure(state="disabled")
         
         self.status_var.set("🔵 啟動中...")
         self.on_bot_status_change("🔵 啟動中...")
@@ -1213,13 +1402,13 @@ class ZuvioGUI(GUI_BASE_CLASS):
         self.password_entry.configure(state="normal")
         self.start_combo.configure(state="normal")
         self.end_combo.configure(state="normal")
-        self.tg_token_entry.configure(state="normal")
-        self.tg_chat_entry.configure(state="normal")
-        self.tg_switch.configure(state="normal")
+        self.line_token_entry.configure(state="normal")
+        self.line_user_entry.configure(state="normal")
+        self.line_switch.configure(state="normal")
         self.gps_switch.configure(state="normal")
         self.gps_entry.configure(state="normal")
         self.save_btn.configure(state="normal")
-        self.tg_test_btn.configure(state="normal")
+        self.line_test_btn.configure(state="normal")
         
         self.status_var.set("🔴 已停止")
         self.on_bot_status_change("🔴 已停止")
@@ -1278,8 +1467,8 @@ if __name__ == "__main__":
                 )
                 sys.exit(1)
             
-        bot.tg_token   = cfg.get('tg_token')   if cfg.get('tg_enabled') else None
-        bot.tg_chat_id = cfg.get('tg_chat_id') if cfg.get('tg_enabled') else None
+        bot.line_token   = cfg.get('line_token')   if cfg.get('line_enabled') else None
+        bot.line_user_id = cfg.get('line_user_id') if cfg.get('line_enabled') else None
         bot.apply_runtime_config(cfg)
 
         # ── 主排程迴圈（與 GUI 共用同一份 monitor_loop）──────────

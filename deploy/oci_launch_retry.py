@@ -3,7 +3,7 @@ Oracle Cloud ARM (VM.Standard.A1.Flex) 自動搶機腳本
 
 Always Free 的 ARM 容量常常缺貨，手動按 Create 只會一直看到
 「Out of capacity」。這支腳本會每隔幾分鐘自動嘗試建立實例，搶到就停，
-並印出 Public IP（有設定 Telegram 時也會推播通知）。
+並印出 Public IP（有設定 LINE 時也會推播通知）。
 
 前置需求：
   1. pip install oci          （或 oci-cli，內含 SDK）
@@ -55,37 +55,41 @@ def log(msg: str):
     print(f"[{now}] {msg}", flush=True)
 
 
-def _load_telegram():
-    """優先讀環境變數，其次讀專案根目錄的 settings.json（只取 Telegram 欄位）。"""
-    token = os.environ.get("ZUVIO_TG_TOKEN")
-    chat_id = os.environ.get("ZUVIO_TG_CHAT_ID")
-    if token and chat_id:
-        return token, chat_id
+def _load_line():
+    """優先讀環境變數，其次讀專案根目錄的 settings.json（只取 LINE 欄位）。"""
+    token = os.environ.get("ZUVIO_LINE_TOKEN")
+    user_id = os.environ.get("ZUVIO_LINE_USER_ID")
+    if token and user_id:
+        return token, user_id
     path = os.path.join(REPO_DIR, "settings.json")
     try:
         with open(path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-        if cfg.get("tg_enabled") and cfg.get("tg_token") and cfg.get("tg_chat_id"):
-            return cfg["tg_token"], cfg["tg_chat_id"]
+        if cfg.get("line_enabled") and cfg.get("line_token") and cfg.get("line_user_id"):
+            return cfg["line_token"], cfg["line_user_id"]
     except Exception:
         pass
     return None, None
 
 
 def notify(message: str):
-    token, chat_id = _load_telegram()
-    if not (token and chat_id):
+    """用 LINE Messaging API 推播（未設定 LINE 時略過）。"""
+    token, user_id = _load_line()
+    if not (token and user_id):
         return
     try:
         req = urllib.request.Request(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            data=json.dumps({"chat_id": chat_id, "text": message}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            "https://api.line.me/v2/bot/message/push",
+            data=json.dumps({
+                "to": user_id,
+                "messages": [{"type": "text", "text": message}],
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
             method="POST",
         )
         urllib.request.urlopen(req, timeout=10).close()
     except Exception as e:
-        log(f"[Telegram] 通知發送失敗：{e}")
+        log(f"[LINE] 通知發送失敗：{e}")
 
 
 # ──────────────────────────────────────────────

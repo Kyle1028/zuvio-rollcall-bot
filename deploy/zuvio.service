@@ -14,7 +14,7 @@ Environment=HOME=/home/ubuntu
 # 讓程式用 snap 的 Chromium 與配對好的 chromedriver（非機密，直接寫在這）
 Environment=ZUVIO_CHROME_BIN=/snap/bin/chromium
 Environment=ZUVIO_CHROMEDRIVER=/snap/bin/chromium.chromedriver
-# 機密（帳密、Telegram）放這個 root-only 檔，不進專案目錄
+# 機密（帳密、LINE token）放這個 root-only 檔，不進專案目錄
 EnvironmentFile=/etc/zuvio.env
 ExecStart=/home/ubuntu/zuvio-rollcall-bot/.venv/bin/python /home/ubuntu/zuvio-rollcall-bot/Zuvio.py --cli
 # 崩潰自動重啟；RestartSec 設 30 秒，配合 systemd 預設限流不會被誤判為 flapping

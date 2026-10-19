@@ -109,11 +109,11 @@ nano settings.json   # 視需要改 active_start / active_end / gps
 
 ---
 
-## 6. 放機密(帳密 / Telegram)
+## 6. 放機密(帳密 / LINE)
 
 ```bash
 sudo cp deploy/zuvio.env.example /etc/zuvio.env
-sudo nano /etc/zuvio.env          # 填入真實帳密與（選填）Telegram
+sudo nano /etc/zuvio.env          # 填入真實帳密與（選填）LINE token / User ID
 sudo chmod 600 /etc/zuvio.env     # 只有 root 能讀
 sudo chown root:root /etc/zuvio.env
 ```
@@ -138,7 +138,7 @@ systemctl status zuvio          # 看服務是否 active (running)
 journalctl -u zuvio -f          # 即時跟看日誌（Ctrl+C 離開）
 ```
 
-如果 Telegram 有設定,啟動成功時手機應該會收到「已啟動」通知。
+如果 LINE 有設定,啟動成功時手機應該會收到「已啟動」通知(一天只發一次)。LINE 的設定方式見專案根目錄 `README.md` 的「LINE 通知設定」。
 
 ---
 
