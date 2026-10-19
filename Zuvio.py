@@ -917,12 +917,13 @@ class ZuvioBot:
 # [6] CustomTkinter 介面設計類別
 # ──────────────────────────────────────────────
 class ZuvioGUI(GUI_BASE_CLASS):
-    def __init__(self, bot_instance):
+    def __init__(self, bot_instance, autostart: bool = False):
         if not GUI_AVAILABLE:
             return
         super().__init__()
         self.bot = bot_instance
         self.bot_thread = None
+        self.autostart = autostart
         
         # 視窗基本設定
         self.title("Zuvio 自動點名助手 - 2026 GUI版")
@@ -968,6 +969,11 @@ class ZuvioGUI(GUI_BASE_CLASS):
         
         # 綁定視窗關閉事件
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # --autostart（開機自動啟動用）：視窗縮小到工作列，並在介面就緒後自動按「開始」
+        if self.autostart:
+            self.after(300, self.iconify)
+            self.after(1500, self.start_bot)
 
     def create_widgets(self):
         # 1. 頂部狀態標題欄 (Row 0, 跨兩欄)
@@ -1437,6 +1443,8 @@ class ZuvioGUI(GUI_BASE_CLASS):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Zuvio 自動點名助手")
     parser.add_argument("--cli", action="store_true", help="以命令列 (CLI) 模式啟動")
+    parser.add_argument("--autostart", action="store_true",
+                        help="GUI 模式：啟動後自動開始監控並縮小視窗（供開機自動啟動使用）")
     args = parser.parse_args()
 
     # 如果指定 --cli，或是環境不支援 GUI（未安裝 customtkinter），則走命令列模式
@@ -1483,5 +1491,5 @@ if __name__ == "__main__":
     else:
         # 啟動 GUI 介面模式
         bot = ZuvioBot()
-        app = ZuvioGUI(bot)
+        app = ZuvioGUI(bot, autostart=args.autostart)
         app.mainloop()
