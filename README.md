@@ -54,7 +54,7 @@ pip install -r requirements.txt
 ### 📥 快速下載與使用 (給一般使用者)
 
 如果你不會寫程式，可以直接下載打包好的執行檔 (Windows 專用)：
-1. 到 [Releases 頁面](https://github.com/Demohu/zuvio-rollcall-bot/releases) 下載最新的 `Zuvio.exe`。
+1. 到 [Releases 頁面](https://github.com/Kyle1028/zuvio-rollcall-bot/releases) 下載最新的 `Zuvio.exe`。
 2. 將 `Zuvio.exe` 放在一個專屬資料夾 (例如桌面新增一個 `Zuvio 自動點名` 資料夾)。
 3. 直接雙擊執行 `Zuvio.exe`。
 4. 在圖形介面輸入帳號密碼，設定好上課時間後，按下 **「▶ 開始自動點名」** 即可放在背景執行！

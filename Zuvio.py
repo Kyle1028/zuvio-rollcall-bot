@@ -805,7 +805,7 @@ class ZuvioGUI(GUI_BASE_CLASS):
         
         self.subtitle_label = ctk.CTkLabel(
             self.header_frame, 
-            text="v1.1 Stable", 
+            text="v1.2 Stable",
             font=ctk.CTkFont(size=12), 
             text_color="grey"
         )
