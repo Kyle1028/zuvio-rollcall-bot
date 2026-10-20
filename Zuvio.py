@@ -72,6 +72,10 @@ PAGE_LOAD_TIMEOUT      = 20   # 單一頁面最長載入時間；超過就停止
 DRIVER_COMMAND_TIMEOUT = 60   # 與 chromedriver 單次溝通的上限；超過視為 Chrome 卡死（Selenium 預設 120）
 DRIVER_QUIT_TIMEOUT    = 15   # 正常關閉 Chrome 的等待上限；超過就強制結束程序
 LOGIN_TIMEOUT          = 20   # 登入後最多等這麼久確認是否進到課程頁
+SCRIPT_TIMEOUT         = 30   # execute_async_script（fetch 輪詢）的上限
+CONSECUTIVE_TIMEOUT_LIMIT = 3 # 連續這麼多門課逾時就視為 Chrome 卡死、重開
+DRIVER_RECYCLE_MINUTES = 60   # 同一個 Chrome 最多連續用這麼久就換新的（預防長時間運作後退化）
+CHROME_MARKER = '--zuvio-rollcall-bot'  # 加在 Chrome 啟動參數上的標記，用來辨認並清除本程式留下的孤兒 Chrome
 
 # LINE 通知節流（免費方案每月訊息數有限，異常類通知不能洗版）
 NOTIFY_ALERT_COOLDOWN  = 3600 # 同類異常通知的最短間隔（秒）
@@ -212,6 +216,8 @@ def build_driver(lat: float = None, lon: float = None) -> webdriver.Chrome:
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option('useAutomationExtension', False)
     options.add_argument('--log-level=3')
+    # Chrome 會忽略不認識的參數；這個標記只用來在工作管理員／清理程序裡辨認「這是本程式開的 Chrome」
+    options.add_argument(CHROME_MARKER)
 
     # 設定 Geolocation 權限為允許 (1: Allow, 2: Block, 0: Ask)
     prefs = {
@@ -279,6 +285,7 @@ def build_driver(lat: float = None, lon: float = None) -> webdriver.Chrome:
     # 防卡死：頁面最多等 PAGE_LOAD_TIMEOUT 秒；與 chromedriver 的每次溝通最多等
     # DRIVER_COMMAND_TIMEOUT 秒（Selenium 預設 120 秒，Chrome 卡死時每個動作都要白等兩分鐘）
     driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+    driver.set_script_timeout(SCRIPT_TIMEOUT)
     client_config = getattr(driver.command_executor, '_client_config', None)
     if client_config is not None:
         client_config.timeout = DRIVER_COMMAND_TIMEOUT
@@ -286,8 +293,41 @@ def build_driver(lat: float = None, lon: float = None) -> webdriver.Chrome:
     return driver
 
 
+def cleanup_orphan_chromes():
+    """清除本程式先前留下、但父程序已不在的無頭 Chrome／chromedriver（僅 Windows）。
+
+    程式若被強制結束（關閉終端機、taskkill、當機），底下的 Chrome 常常不會跟著結束，
+    累積起來會吃光記憶體並拖垮之後新開的 Chrome。只處理帶有 CHROME_MARKER 的 Chrome
+    與父程序已消失的 chromedriver，不會動到使用者自己開的瀏覽器或正在運作中的實例。
+    """
+    if os.name != 'nt':
+        return
+    ps = (
+        "$ps = Get-CimInstance Win32_Process | Where-Object { $_.Name -in 'chrome.exe','chromedriver.exe' };"
+        "$alive = @(Get-Process | Select-Object -ExpandProperty Id);"
+        "$v = $ps | Where-Object { ($alive -notcontains $_.ParentProcessId) -and "
+        f"( $_.Name -eq 'chromedriver.exe' -or $_.CommandLine -like '*{CHROME_MARKER}*' ) }};"
+        "$v | ForEach-Object { taskkill /PID $_.ProcessId /T /F 2>&1 | Out-Null };"
+        "($v | Measure-Object).Count"
+    )
+    try:
+        r = subprocess.run(
+            ['powershell', '-NoProfile', '-NonInteractive', '-Command', ps],
+            capture_output=True, text=True, timeout=30, creationflags=0x08000000,
+        )
+        n = int((r.stdout or '0').strip().splitlines()[-1] or 0)
+        if n:
+            log(f"[驅動] 已清除 {n} 個先前殘留的無頭 Chrome／chromedriver 程序。")
+    except Exception as e:
+        log(f"[驅動] 清理殘留 Chrome 程序時發生錯誤（略過）：{short_err(e)}", level='warning')
+
+
 class DriverUnresponsive(Exception):
     """Chrome / chromedriver 已沒有回應，必須關掉重開。"""
+
+
+class DriverRecycle(Exception):
+    """Chrome 已連續運作太久，依排程換一個新的（不是故障）。"""
 
 
 # 出現在 WebDriverException 訊息中、代表瀏覽器已經掛掉的關鍵字
@@ -366,6 +406,7 @@ class ZuvioBot:
         self._startup_notified_date = None
         self._page_timeout_warned = False
         self.driver      = None
+        self.driver_started_at = None
         self.wait        = None
         self.active_start = 8
         self.active_end   = 18
@@ -391,8 +432,10 @@ class ZuvioBot:
             except Exception as e:
                 log(f"[驅動] GPS 座標解析失敗，將使用系統預設位置。原因: {e}", level='warning')
 
+        cleanup_orphan_chromes()
         self.driver = build_driver(lat, lon)
         self.wait   = WebDriverWait(self.driver, 20)
+        self.driver_started_at = time.time()
         log("[驅動] Chrome 啟動完成。")
 
     def stop_driver(self):
@@ -658,6 +701,52 @@ class ZuvioBot:
                     "（此提醒每次啟動只顯示一次）。", level='warning')
                 self._page_timeout_warned = True
 
+    # ── 點名狀態輪詢（不換頁）────────────────────
+    # 在目前頁面內用 fetch 抓點名頁的 HTML 來判斷狀態。每次約 0.1 秒，而且不觸發
+    # 整頁導覽，Chrome 不會因為一天幾千次換頁而逐漸退化（實測連續換頁約半小時後
+    # 就會開始每頁載入逾時）。只有真的「簽到開放中」才切到該頁按簽到。
+    _FETCH_STATUS_JS = """
+        const url = arguments[0];
+        const done = arguments[arguments.length - 1];
+        fetch(url, {credentials: 'include', cache: 'no-store', redirect: 'follow'})
+          .then(r => r.text().then(t => done({
+              ok: true, status: r.status, url: r.url, length: t.length,
+              open: t.includes('簽到開放中'),
+              // 正常的點名頁一定有簽到按鈕（或至少有「簽到」字樣）；
+              // 登入失效時 Zuvio 回 200 但內容是空的，或被導到登入頁
+              page: t.includes('submit-make-rollcall') || t.includes('簽到'),
+              login: t.includes('login-btn') || t.includes('id="password"'),
+          })))
+          .catch(e => done({ok: false, error: String(e)}));
+    """
+
+    def _rollcall_is_open(self, c_id: str) -> bool:
+        """回傳該課程目前是否「簽到開放中」。
+
+        fetch 失敗（例如網路瞬斷）時退回原本的換頁判斷；偵測到已被登出時丟出
+        DriverUnresponsive，讓 monitor_loop 重開 Chrome 並重新登入。
+        """
+        url = URI.format(c_id)
+        # fetch 需要在 Zuvio 同網域的頁面上執行才會帶 cookie
+        if "zuvio.com.tw" not in (self.driver.current_url or ""):
+            self._open_page("https://irs.zuvio.com.tw/student5/irs/index")
+
+        result = self.driver.execute_async_script(self._FETCH_STATUS_JS, url)
+        if not isinstance(result, dict) or not result.get('ok'):
+            err = result.get('error') if isinstance(result, dict) else result
+            log(f"[輪詢] fetch 失敗（{err}），改用換頁方式判斷。", level='warning')
+            self._open_page(url)
+            return "簽到開放中" in self.driver.page_source
+
+        if result.get('login') or '/login' in (result.get('url') or '') or not result.get('page'):
+            raise DriverUnresponsive(
+                f"登入狀態已失效（回應 HTTP {result.get('status')}、{result.get('length', 0)} 字元），需要重新登入"
+            )
+        if result.get('status') != 200:
+            log(f"[輪詢] 點名頁回應 HTTP {result.get('status')}，本輪視為未開放。", level='warning')
+            return False
+        return bool(result.get('open'))
+
     # ── 登入 ────────────────────────────────────
     def login(self, email: str, password: str):
         self._open_page("https://irs.zuvio.com.tw/")
@@ -718,8 +807,13 @@ class ZuvioBot:
         active_count = sum(1 for c_id in courses if self.monitored_course_ids is None or c_id in self.monitored_course_ids)
         log(f"[監控] 開始掃描，設定監控 {active_count}/{len(courses)} 門課程。")
         consecutive_driver_errors = 0
+        consecutive_timeouts = 0
 
         while self.is_active_time() and not self.stop_event.is_set():
+            # 同一個 Chrome 用太久就換新的，避免長時間運作後退化
+            if self.driver_started_at and time.time() - self.driver_started_at > DRIVER_RECYCLE_MINUTES * 60:
+                raise DriverRecycle()
+
             for c_id, c_name in courses.items():
                 if self.stop_event.is_set():
                     return
@@ -732,18 +826,24 @@ class ZuvioBot:
                     continue
 
                 try:
-                    self._open_page(URI.format(c_id))
-
-                    if "簽到開放中" not in self.driver.page_source:
+                    if not self._rollcall_is_open(c_id):
                         consecutive_driver_errors = 0
+                        consecutive_timeouts = 0
                         if self.sleep_interruptible(SCAN_PER_COURSE_DELAY):
                             return
+                        continue
+
+                    # 真的開放了才切到點名頁，再確認一次後按簽到
+                    self._open_page(URI.format(c_id))
+                    if "簽到開放中" not in self.driver.page_source:
+                        log(f"[略過] {c_name}：切換到點名頁後狀態已非開放，下一輪再確認。", level='warning')
                         continue
 
                     self.driver.execute_script(
                         "arguments[0].click();",
                         self.driver.find_element(By.ID, "submit-make-rollcall")
                     )
+                    consecutive_timeouts = 0
 
                     now_str = datetime.datetime.now().strftime('%H:%M:%S')
                     log(f"[{now_str}] ★ {c_name} | 點名成功！")
@@ -764,10 +864,14 @@ class ZuvioBot:
                     )
 
                 except TimeoutException:
+                    consecutive_timeouts += 1
                     log(
-                        f"[略過] {c_name}：頁面載入逾時，等待下一輪重試。",
+                        f"[略過] {c_name}：頁面載入逾時（連續第 {consecutive_timeouts} 次），等待下一輪重試。",
                         level='warning'
                     )
+                    # 連續多門課都逾時，幾乎可以確定是 Chrome 本身卡住了，不是單一頁面的問題
+                    if consecutive_timeouts >= CONSECUTIVE_TIMEOUT_LIMIT:
+                        raise DriverUnresponsive(f"連續 {consecutive_timeouts} 門課頁面載入逾時")
 
                 except WebDriverException as e:
                     # Chrome 已卡死／斷線：不要再一門一門白等，交給 monitor_loop 重開
@@ -884,6 +988,13 @@ class ZuvioBot:
             self.update_status("🟢 監控中")
             try:
                 self.run_session(course_list)
+            except DriverRecycle:
+                log(f"[驅動] Chrome 已連續運作 {DRIVER_RECYCLE_MINUTES} 分鐘，依排程換新的以保持穩定。")
+                self.update_status("🔄 定期更換 Chrome 中...")
+                self.stop_driver()
+                if self.sleep_interruptible(2):
+                    break
+                continue
             except DriverUnresponsive as e:
                 # Chrome 卡死：關掉（必要時強制結束）後回到迴圈開頭，重開 Chrome 並重新登入
                 now = time.time()
