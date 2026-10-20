@@ -57,6 +57,9 @@ else:
 
 CONFIG_FILE_PATH = os.path.join(BASE_DIR, 'settings.json')
 LOG_FILE_PATH = os.path.join(BASE_DIR, 'zuvio_bot.log')
+# 心跳檔：bot 每 HEARTBEAT_INTERVAL 秒更新一次，供 deploy/watchdog.py 判斷程式是否還活著
+HEARTBEAT_FILE_PATH = os.path.join(BASE_DIR, 'zuvio_heartbeat.json')
+HEARTBEAT_INTERVAL = 30
 
 URI = "https://irs.zuvio.com.tw/student5/irs/rollcall/{}"
 GUI_LOG_QUEUE = None  # 用於與 GUI 執行緒通訊的日誌佇列
@@ -407,6 +410,7 @@ class ZuvioBot:
         self._page_timeout_warned = False
         self.driver      = None
         self.driver_started_at = None
+        self._last_heartbeat = 0.0
         self.wait        = None
         self.active_start = 8
         self.active_end   = 18
@@ -582,6 +586,34 @@ class ZuvioBot:
         if self.courses_cb:
             self.courses_cb(courses)
 
+    # ── 心跳（供看門狗判斷是否存活）──────────────────
+    def write_heartbeat(self, state: str = 'running', force: bool = False):
+        """把目前狀態寫進心跳檔。
+
+        state：
+          running         正常運作中（含時段外休眠）→ 看門狗發現心跳過期或程序消失會重啟
+          stopped_by_user 使用者按了停止      → 看門狗不會動它
+          exited_by_user  使用者關閉程式      → 看門狗不會動它
+          fatal           需要人工處理的錯誤（例如帳密錯誤）→ 看門狗不會一直重啟
+        一般呼叫每 HEARTBEAT_INTERVAL 秒最多寫一次；force=True 立即寫。
+        """
+        now = time.time()
+        if not force and now - self._last_heartbeat < HEARTBEAT_INTERVAL:
+            return
+        self._last_heartbeat = now
+        try:
+            tmp = HEARTBEAT_FILE_PATH + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'pid': os.getpid(),
+                    'ts': now,
+                    'time': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'state': state,
+                }, f, ensure_ascii=False)
+            os.replace(tmp, HEARTBEAT_FILE_PATH)
+        except Exception:
+            pass  # 心跳寫不進去不該影響監控本身
+
     # ── 可中斷的休眠 ─────────────────────────────
     def sleep_interruptible(self, seconds: float) -> bool:
         """可隨時被 stop_event 中斷的休眠。若被中斷回傳 True。"""
@@ -590,6 +622,7 @@ class ZuvioBot:
         while slept < seconds:
             if self.stop_event.is_set():
                 return True
+            self.write_heartbeat()  # 所有迴圈都會經過這裡，順便更新心跳（內部有節流）
             time.sleep(step)
             slept += step
         return False
@@ -910,6 +943,7 @@ class ZuvioBot:
         log("=" * 45)
         log(" Zuvio 自動點名助手 - 開始監控")
         log("=" * 45)
+        self.write_heartbeat('running', force=True)
 
         start_failures = 0     # 連續 Chrome 啟動失敗次數
         login_failures = 0     # 連續登入／取課失敗次數
@@ -1504,11 +1538,28 @@ class ZuvioGUI(GUI_BASE_CLASS):
         self.bot_thread.start()
         
     def run_bot_thread(self):
+        """背景執行緒入口：外層是守護迴圈，監控迴圈發生未預期錯誤時自動重新開始。
+
+        monitor_loop 只會在 stop_event 被設定（使用者按停止）時正常返回；
+        其他任何例外都視為意外，記錄後等 30 秒再重來，而不是讓監控就此停擺。
+        """
         try:
-            self.bot.run_gui_loop()
-        except Exception as e:
-            log(f"[系統致命錯誤] {e}", level='critical')
+            while not self.bot.stop_event.is_set():
+                try:
+                    self.bot.monitor_loop()
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    log(f"[系統錯誤] 監控發生未預期錯誤，30 秒後自動重新開始：{e}\n{tb}", level='critical')
+                    self.bot.notify(
+                        f"⚠️ Zuvio 點名助手發生未預期錯誤，已自動重新開始監控。\n原因：{short_err(e, 120)}",
+                        category='fatal',
+                    )
+                    self.bot.stop_driver()
+                    if self.bot.sleep_interruptible(30):
+                        break
         finally:
+            # 走到這裡一定是使用者主動停止；告訴看門狗不要把它拉起來
+            self.bot.write_heartbeat('stopped_by_user', force=True)
             self.after(0, self.on_bot_thread_finish)
             
     def on_bot_thread_finish(self):
@@ -1541,9 +1592,11 @@ class ZuvioGUI(GUI_BASE_CLASS):
         if self.stop_btn.cget("state") == "normal":
             if messagebox.askokcancel("關閉程式", "Zuvio 點名助手正在運行中，確定要結束程式嗎？"):
                 self.bot.stop_event.set()
+                self.bot.write_heartbeat('exited_by_user', force=True)
                 self.bot.stop_driver()
                 self.destroy()
         else:
+            self.bot.write_heartbeat('exited_by_user', force=True)
             self.bot.stop_driver()
             self.destroy()
 
@@ -1591,11 +1644,29 @@ if __name__ == "__main__":
         bot.apply_runtime_config(cfg)
 
         # ── 主排程迴圈（與 GUI 共用同一份 monitor_loop）──────────
+        # 外層同樣是守護迴圈：未預期錯誤 → 記錄、等 30 秒、重來；Ctrl+C 才真正結束
         try:
-            bot.monitor_loop()
+            while True:
+                try:
+                    bot.monitor_loop()
+                    break
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    log(f"[系統錯誤] 監控發生未預期錯誤，30 秒後自動重新開始：{e}\n{tb}", level='critical')
+                    bot.notify(
+                        f"⚠️ Zuvio 點名助手發生未預期錯誤，已自動重新開始監控。\n原因：{short_err(e, 120)}",
+                        category='fatal',
+                    )
+                    bot.stop_driver()
+                    if bot.sleep_interruptible(30):
+                        break
         except KeyboardInterrupt:
             log("\n[結束] 收到中斷信號，程式正在關閉...")
-            bot.notify("🔴 Zuvio Bot 已手動關閉\n若要繼續監控請重新啟動。")
+            bot.write_heartbeat('exited_by_user', force=True)
+        except SystemExit:
+            # 例如帳密錯誤：需要人工處理，標記後讓看門狗不要一直重啟
+            bot.write_heartbeat('fatal', force=True)
+            raise
         finally:
             bot.stop_driver()
             log("[結束] 程式已安全退出。")

@@ -15,6 +15,11 @@ zuvio_bot.log
 zuvio.log
 *.log
 
+# Runtime state (heartbeat for the watchdog, watchdog's own state)
+zuvio_heartbeat.json
+zuvio_heartbeat.json.tmp
+zuvio_watchdog_state.json
+
 # Editor configurations
 .vscode/
 .idea/
