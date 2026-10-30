@@ -6,6 +6,8 @@
   註冊兩個排程工作：
     ZuvioRollcallBot  登入後 30 秒以 pythonw.exe（無主控台視窗）執行 Zuvio.py：
                         預設        --autostart  GUI 自動按「開始」並縮小到工作列
+                        -Tray       --autostart --tray  視窗隱藏，右下角系統匣圖示顯示狀態
+                                                 與操作（建議；需 pip install pystray Pillow）
                         -Background --cli        完全無視窗在背景執行（狀態看 log／LINE，
                                                  管理用 deploy\bot.ps1）
                       程序異常結束時排程器會自動重啟（最多 3 次，間隔 1 分鐘）。
@@ -14,6 +16,7 @@
 
   用法（在專案目錄開 PowerShell）：
     .\deploy\install_autostart.ps1              # 安裝／更新（GUI 縮小到工作列）
+    .\deploy\install_autostart.ps1 -Tray        # 安裝／更新（系統匣圖示模式，建議）
     .\deploy\install_autostart.ps1 -Background  # 安裝／更新（完全無視窗背景執行）
     .\deploy\install_autostart.ps1 -Uninstall   # 移除兩個工作
     .\deploy\install_autostart.ps1 -UseExe      # bot 改用 dist\Zuvio.exe（需把 settings.json 放在 dist\）
@@ -24,7 +27,8 @@
 param(
     [switch]$Uninstall,
     [switch]$UseExe,
-    [switch]$Background
+    [switch]$Background,
+    [switch]$Tray
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,7 +56,7 @@ if (-not (Test-Path $pythonw)) { throw "找不到 $pythonw" }
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 
 # ── 1. bot 本體：登入時啟動 ─────────────────────────────
-$mode = if ($Background) { '--cli' } else { '--autostart' }
+$mode = if ($Tray) { '--autostart --tray' } elseif ($Background) { '--cli' } else { '--autostart' }
 if ($UseExe) {
     $exe = Join-Path $ProjectDir 'dist\Zuvio.exe'
     if (-not (Test-Path $exe)) { throw "找不到 $exe，請先執行 Compile.bat 打包。" }
@@ -95,7 +99,7 @@ $wdSettings = New-ScheduledTaskSettingsSet `
 Register-ScheduledTask -TaskName $WatchdogTask -Action $wdAction -Trigger $wdTrigger `
     -Settings $wdSettings -Principal $principal -Force | Out-Null
 
-$modeDesc = if ($Background) { '完全無視窗背景執行' } else { 'GUI 自動開始並縮小到工作列' }
+$modeDesc = if ($Tray) { '系統匣圖示模式' } elseif ($Background) { '完全無視窗背景執行' } else { 'GUI 自動開始並縮小到工作列' }
 Write-Host "已註冊排程工作："
 Write-Host "  $BotTask：使用者 $env:USERNAME 登入後 30 秒啟動（$modeDesc）"
 Write-Host "    $($botAction.Execute) $($botAction.Arguments)"

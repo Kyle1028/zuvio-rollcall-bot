@@ -25,6 +25,7 @@ echo Installing dependencies...
 if %ERRORLEVEL% NEQ 0 goto :fail
 
 "%BUILD_VENV%\Scripts\python.exe" -m PyInstaller --clean --onefile --noconsole ^
+    --hidden-import pystray._win32 ^
     --workpath "%BUILD_TMP%" --specpath "%BUILD_TMP%" --distpath dist Zuvio.py
 if %ERRORLEVEL% NEQ 0 goto :fail
 

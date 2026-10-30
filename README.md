@@ -92,12 +92,16 @@ python Zuvio.py --cli
 專案附有安裝腳本，會在**工作排程器**註冊兩個工作：登入後 30 秒自動啟動 bot，以及每 5 分鐘執行一次的**看門狗**（bot 卡住或消失時自動清掉殘留程序並重啟，使用者自己停止時不會干預）。
 
 ```powershell
-.\deploy\install_autostart.ps1 -Background   # 完全無視窗，在背景執行（建議）
-.\deploy\install_autostart.ps1               # 或：GUI 自動開始並縮小到工作列
+.\deploy\install_autostart.ps1 -Tray         # 系統匣圖示模式（建議）：視窗隱藏，右下角圖示顯示狀態
+.\deploy\install_autostart.ps1 -Background   # 完全無視窗，在背景執行
+.\deploy\install_autostart.ps1               # GUI 自動開始並縮小到工作列
 .\deploy\install_autostart.ps1 -Uninstall    # 移除
 ```
 
-背景模式沒有視窗，日常用管理腳本操作：
+系統匣模式：圖示顏色＝狀態（綠：監控中、橘：時段外休眠、紅：錯誤、灰：已停止），左鍵點兩下叫出視窗，右鍵選單可開始／停止／開啟日誌／結束；按視窗的 X 只會縮回系統匣。
+若右下角沒看到圖示，點工作列的「^」展開隱藏的圖示，或到「設定 → 個人化 → 工作列 → 其他系統匣圖示」把它設為一律顯示。
+
+沒有視窗時也可用管理腳本操作：
 
 ```powershell
 .\deploy\bot.ps1 status    # 是否在跑、心跳時間、最近日誌

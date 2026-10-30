@@ -44,6 +44,13 @@ except ImportError:
     GUI_AVAILABLE = False
     GUI_BASE_CLASS = object
 
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    TRAY_AVAILABLE = True
+except ImportError:
+    TRAY_AVAILABLE = False
+
 
 # ──────────────────────────────────────────────
 # [1] 常數與全域設定 (路徑動態解析，確保 exe 能抓到同目錄設定檔與日誌)
@@ -1056,13 +1063,16 @@ class ZuvioBot:
 # [6] CustomTkinter 介面設計類別
 # ──────────────────────────────────────────────
 class ZuvioGUI(GUI_BASE_CLASS):
-    def __init__(self, bot_instance, autostart: bool = False):
+    def __init__(self, bot_instance, autostart: bool = False, tray: bool = False):
         if not GUI_AVAILABLE:
             return
         super().__init__()
         self.bot = bot_instance
         self.bot_thread = None
         self.autostart = autostart
+        self.tray_requested = tray
+        self.tray_mode = tray and TRAY_AVAILABLE   # 系統匣模式：視窗隱藏，由右下角圖示操作
+        self.tray = None
         
         # 視窗基本設定
         self.title("Zuvio 自動點名助手 - 2026 GUI版")
@@ -1109,9 +1119,18 @@ class ZuvioGUI(GUI_BASE_CLASS):
         # 綁定視窗關閉事件
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-        # --autostart（開機自動啟動用）：視窗縮小到工作列，並在介面就緒後自動按「開始」
+        # --tray：建立系統匣圖示並隱藏視窗（右下角圖示左鍵點兩下可叫回視窗）
+        if self.tray_mode:
+            self._setup_tray()
+            self.after(300, self.withdraw)
+        elif self.tray_requested:
+            log("[系統] 未安裝 pystray／Pillow，無法使用系統匣模式，改為縮小到工作列。"
+                "請執行 pip install pystray Pillow", level='warning')
+
+        # --autostart（開機自動啟動用）：介面就緒後自動按「開始」；非系統匣模式則縮小到工作列
         if self.autostart:
-            self.after(300, self.iconify)
+            if not self.tray_mode:
+                self.after(300, self.iconify)
             self.after(1500, self.start_bot)
 
     def create_widgets(self):
@@ -1439,6 +1458,7 @@ class ZuvioGUI(GUI_BASE_CLASS):
 
     def _apply_status_ui(self, status):
         self.status_var.set(status)
+        self._update_tray(status)
         # 動態調整 Badge 顏色
         if "監控中" in status:
             self.status_badge.configure(fg_color="#1B5E20", text_color="#A3E635")
@@ -1583,16 +1603,104 @@ class ZuvioGUI(GUI_BASE_CLASS):
         self.bot.stop_event.set()
 
     def on_closing(self):
-        if self.stop_btn.cget("state") == "normal":
-            if messagebox.askokcancel("關閉程式", "Zuvio 點名助手正在運行中，確定要結束程式嗎？"):
-                self.bot.stop_event.set()
-                self.bot.write_heartbeat('exited_by_user', force=True)
-                self.bot.stop_driver()
-                self.destroy()
+        # 系統匣模式：按 X 只是把視窗收回系統匣，bot 繼續跑；要結束請用圖示右鍵「結束程式」
+        if self.tray_mode and self.tray:
+            self.hide_window()
+            return
+        self._exit_app()
+
+    # ── 系統匣圖示（--tray）────────────────────────
+    _TRAY_COLORS = {
+        'green': '#22C55E', 'orange': '#F59E0B', 'red': '#EF4444',
+        'grey': '#9CA3AF', 'blue': '#3B82F6',
+    }
+
+    @staticmethod
+    def _tray_image(color: str):
+        """產生一個單色圓形小圖示（64x64）。"""
+        img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.ellipse((4, 4, 60, 60), fill=color)
+        d.ellipse((22, 22, 42, 42), fill='white')
+        return img
+
+    def _setup_tray(self):
+        """建立系統匣圖示與右鍵選單；pystray 在自己的執行緒跑，回呼一律丟回 Tk 主執行緒。"""
+        self._tray_images = {k: self._tray_image(v) for k, v in self._TRAY_COLORS.items()}
+        menu = pystray.Menu(
+            pystray.MenuItem('顯示視窗', lambda: self.after(0, self.show_window), default=True),
+            pystray.MenuItem('隱藏視窗', lambda: self.after(0, self.hide_window)),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem('開始自動點名', lambda: self.after(0, self._tray_start)),
+            pystray.MenuItem('停止', lambda: self.after(0, self._tray_stop)),
+            pystray.MenuItem('開啟日誌檔', lambda: self.after(0, self.open_log_file)),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem('結束程式', lambda: self.after(0, self._exit_app)),
+        )
+        self.tray = pystray.Icon(
+            'zuvio-rollcall-bot', self._tray_images['grey'], 'Zuvio 點名助手：已停止', menu,
+        )
+        self.tray.run_detached()
+
+    def _update_tray(self, status: str):
+        if not self.tray:
+            return
+        if "監控中" in status:
+            color = 'green'
+        elif "錯誤" in status or "失敗" in status:
+            color = 'red'
+        elif "休眠" in status or "下次" in status or "剩餘" in status:
+            color = 'orange'
+        elif "已停止" in status:
+            color = 'grey'
         else:
-            self.bot.write_heartbeat('exited_by_user', force=True)
-            self.bot.stop_driver()
-            self.destroy()
+            color = 'blue'
+        try:
+            self.tray.icon = self._tray_images[color]
+            self.tray.title = f"Zuvio 點名助手：{status}"[:127]   # Windows 提示文字上限 128 字元
+        except Exception:
+            pass
+
+    def show_window(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def hide_window(self):
+        self.withdraw()
+
+    def _tray_start(self):
+        if self.start_btn.cget("state") == "normal":
+            self.start_bot()
+
+    def _tray_stop(self):
+        if self.stop_btn.cget("state") == "normal":
+            self.stop_bot()
+
+    def open_log_file(self):
+        try:
+            if os.name == 'nt':
+                os.startfile(LOG_FILE_PATH)
+            else:
+                log(f"日誌檔位置：{LOG_FILE_PATH}")
+        except Exception as e:
+            log(f"[系統] 無法開啟日誌檔：{e}", level='warning')
+
+    def _exit_app(self):
+        """真正結束程式（從系統匣選單或非系統匣模式的關閉按鈕）。"""
+        if self.stop_btn.cget("state") == "normal":
+            if not messagebox.askokcancel("關閉程式", "Zuvio 點名助手正在運行中，確定要結束程式嗎？"):
+                return
+            self.bot.stop_event.set()
+        self.bot.write_heartbeat('exited_by_user', force=True)
+        self.bot.stop_driver()
+        if self.tray:
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
+            self.tray = None
+        self.destroy()
 
 
 # ──────────────────────────────────────────────
@@ -1603,6 +1711,8 @@ if __name__ == "__main__":
     parser.add_argument("--cli", action="store_true", help="以命令列 (CLI) 模式啟動")
     parser.add_argument("--autostart", action="store_true",
                         help="GUI 模式：啟動後自動開始監控並縮小視窗（供開機自動啟動使用）")
+    parser.add_argument("--tray", action="store_true",
+                        help="GUI 模式：隱藏視窗，改以右下角系統匣圖示顯示狀態與操作（需安裝 pystray、Pillow）")
     args = parser.parse_args()
 
     # 如果指定 --cli，或是環境不支援 GUI（未安裝 customtkinter），則走命令列模式
@@ -1670,5 +1780,5 @@ if __name__ == "__main__":
     else:
         # 啟動 GUI 介面模式
         bot = ZuvioBot()
-        app = ZuvioGUI(bot, autostart=args.autostart)
+        app = ZuvioGUI(bot, autostart=args.autostart, tray=args.tray)
         app.mainloop()

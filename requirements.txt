@@ -1,3 +1,5 @@
 selenium>=4.15,<5
 webdriver-manager>=4.0,<5
 customtkinter>=5.2,<7
+pystray>=0.19,<1
+Pillow>=10
