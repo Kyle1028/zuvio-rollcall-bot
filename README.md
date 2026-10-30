@@ -87,6 +87,30 @@ python Zuvio.py --cli
 
 *   若無設定檔，系統會引導填寫帳密與 LINE 通知配置，隨後進入無頭瀏覽器監控循環。
 
+### 🖥️ Windows 開機自動啟動與背景執行
+
+專案附有安裝腳本，會在**工作排程器**註冊兩個工作：登入後 30 秒自動啟動 bot，以及每 5 分鐘執行一次的**看門狗**（bot 卡住或消失時自動清掉殘留程序並重啟，使用者自己停止時不會干預）。
+
+```powershell
+.\deploy\install_autostart.ps1 -Background   # 完全無視窗，在背景執行（建議）
+.\deploy\install_autostart.ps1               # 或：GUI 自動開始並縮小到工作列
+.\deploy\install_autostart.ps1 -Uninstall    # 移除
+```
+
+背景模式沒有視窗，日常用管理腳本操作：
+
+```powershell
+.\deploy\bot.ps1 status    # 是否在跑、心跳時間、最近日誌
+.\deploy\bot.ps1 stop      # 停止（看門狗不會把它拉起來）
+.\deploy\bot.ps1 start     # 啟動
+.\deploy\bot.ps1 restart   # 重新啟動
+.\deploy\bot.ps1 log       # 即時跟看日誌（Ctrl+C 離開）
+```
+
+*   狀況通知走 LINE；完整紀錄在 `zuvio_bot.log`。
+*   若希望電腦重開機後不用登入就自動執行，需另行設定 Windows 自動登入（`netplwiz`），請自行評估安全風險。
+*   若出現「已停用指令碼執行」，先執行 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`。
+
 ### 🔔 LINE 通知設定
 
 > LINE Notify 已於 2025/3/31 停止服務，本專案改用 **LINE Messaging API**（免費建立官方帳號即可）。

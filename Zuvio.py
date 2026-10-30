@@ -56,7 +56,8 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CONFIG_FILE_PATH = os.path.join(BASE_DIR, 'settings.json')
-LOG_FILE_PATH = os.path.join(BASE_DIR, 'zuvio_bot.log')
+# 可用環境變數 ZUVIO_LOG_FILE 改寫日誌路徑（測試時用，避免把假事件寫進正式日誌）
+LOG_FILE_PATH = os.environ.get('ZUVIO_LOG_FILE') or os.path.join(BASE_DIR, 'zuvio_bot.log')
 # 心跳檔：bot 每 HEARTBEAT_INTERVAL 秒更新一次，供 deploy/watchdog.py 判斷程式是否還活著
 HEARTBEAT_FILE_PATH = os.path.join(BASE_DIR, 'zuvio_heartbeat.json')
 HEARTBEAT_INTERVAL = 30
@@ -805,18 +806,11 @@ class ZuvioBot:
         if logged_in:
             log(">>> [成功] 登入成功！")
         else:
+            # 不刪設定檔、也不結束程式：交給 monitor_loop 每 30 秒重試，連續失敗會發 LINE 提醒。
+            # （驗證碼或網路瞬斷造成的失敗常常重試就好；真的是帳密錯誤再依提示修正）
             log(">>> [失敗] 登入失敗，可能是帳密錯誤或觸發驗證碼。", level='error')
-            # 不再刪除整個設定檔（會連 LINE／時段／GPS／課程勾選一起清掉）。
-            # 只提示使用者修正帳密後重新啟動；設定檔原封保留。
-            if not self.status_cb:
-                log(
-                    f">>> 請開啟 {self.config_file} 確認 user／pass 欄位是否正確，"
-                    "修正後重新執行。",
-                    level='error',
-                )
-                sys.exit(1)
-            else:
-                raise Exception("登入失敗，請確認帳密。")
+            log(f">>> 若持續失敗，請確認 {self.config_file} 的 user／pass（或環境變數）是否正確。", level='error')
+            raise Exception("登入失敗，請確認帳密。")
 
     # ── 取得課程 ─────────────────────────────────
     def _is_excluded_course(self, name: str) -> bool:
@@ -1617,7 +1611,10 @@ if __name__ == "__main__":
             print("\n⚠️ 偵測到未安裝 customtkinter，將以命令列 (CLI) 模式啟動。")
             print("💡 若要使用精美圖形介面 (GUI)，請執行: pip install customtkinter\n")
             
-        os.system('cls' if os.name == 'nt' else 'clear')
+        # 以 pythonw（無主控台）執行時沒有終端機，不要清螢幕（os.system 會閃出一個黑窗）
+        has_console = sys.stdout is not None and hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
+        if has_console:
+            os.system('cls' if os.name == 'nt' else 'clear')
         print("=" * 45)
         print(" Zuvio 自動點名助手 - 2026 重構穩定版 (CLI)")
         print("=" * 45)
