@@ -18,7 +18,10 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProjectDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $TaskName   = 'ZuvioRollcallBot'
-$Heartbeat  = Join-Path $ProjectDir 'zuvio_heartbeat.json'
+# 心跳檔在使用者本機資料夾（與 Zuvio.py 的 RUNTIME_DIR 一致），不在 OneDrive 同步的專案目錄
+$RuntimeDir = if ($env:ZUVIO_RUNTIME_DIR) { $env:ZUVIO_RUNTIME_DIR } else { Join-Path $env:LOCALAPPDATA 'ZuvioBot' }
+if (-not (Test-Path $RuntimeDir)) { New-Item -ItemType Directory -Path $RuntimeDir -Force | Out-Null }
+$Heartbeat  = Join-Path $RuntimeDir 'zuvio_heartbeat.json'
 $LogFile    = Join-Path $ProjectDir 'zuvio_bot.log'
 
 function Read-Heartbeat {

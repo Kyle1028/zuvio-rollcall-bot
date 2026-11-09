@@ -27,7 +27,7 @@ import Zuvio as Z  # noqa: E402  （沿用同一份日誌、LINE 設定與孤兒
 TASK_NAME = 'ZuvioRollcallBot'
 STALE_SECONDS = 600                      # 心跳超過 10 分鐘沒更新就視為卡死
 NOTIFY_COOLDOWN = 3600                   # 看門狗的 LINE 通知每小時最多一則
-STATE_FILE = os.path.join(Z.BASE_DIR, 'zuvio_watchdog_state.json')
+STATE_FILE = os.path.join(Z.RUNTIME_DIR, 'zuvio_watchdog_state.json')
 SKIP_STATES = ('stopped_by_user', 'exited_by_user', 'fatal')
 
 STILL_ACTIVE = 259
@@ -84,18 +84,37 @@ def is_pid_alive(pid) -> bool:
         k32.CloseHandle(handle)
 
 
-def is_bot_process(pid) -> bool:
-    """確認該 PID 真的是本程式（避免 PID 被回收給別的程式後誤殺）。"""
+def is_bot_process(pid):
+    """確認該 PID 真的是本程式（避免 PID 被回收給別的程式後誤殺）。
+
+    回傳 True / False；查不出來（PowerShell 逾時、WMI 忙碌）回傳 None，
+    呼叫端必須把 None 當作「不確定＝不要動它」，否則系統一忙就會誤殺健康的 bot。
+    """
     ps = (f"$p = Get-CimInstance Win32_Process -Filter 'ProcessId = {int(pid)}';"
-          "if ($p) { $p.Name + '|' + $p.CommandLine }")
+          "if ($p) { $p.Name + '|' + $p.CommandLine } else { 'NONE|' }")
     try:
         r = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps],
-                           capture_output=True, text=True, timeout=30, creationflags=0x08000000)
+                           capture_output=True, text=True, timeout=45, creationflags=0x08000000)
         out = (r.stdout or '').strip()
+        if r.returncode != 0 or '|' not in out:
+            return None
         name, _, cmd = out.partition('|')
+        if name == 'NONE':
+            return False
         return name.lower() in ('python.exe', 'pythonw.exe', 'zuvio.exe') and 'zuvio' in cmd.lower()
     except Exception:
+        return None
+
+
+def resolve_alive(pid) -> bool:
+    """綜合判斷 PID 是否為存活中的 bot；身分查不出來時一律視為存活（fail-open）。"""
+    if not is_pid_alive(pid):
         return False
+    ident = is_bot_process(pid)
+    if ident is None:
+        log(f"無法確認 PID {pid} 的身分（系統忙碌），保守視為存活。", level='warning')
+        return True
+    return ident
 
 
 def kill_tree(pid):
@@ -142,7 +161,7 @@ def main():
 
     hb = read_heartbeat()
     pid = hb.get('pid') if hb else None
-    alive = is_pid_alive(pid) and is_bot_process(pid)
+    alive = resolve_alive(pid) if pid else False
     action, reason = decide(hb, time.time(), alive)
 
     if args.dry_run:

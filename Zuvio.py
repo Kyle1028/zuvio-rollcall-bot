@@ -65,8 +65,16 @@ else:
 CONFIG_FILE_PATH = os.path.join(BASE_DIR, 'settings.json')
 # 可用環境變數 ZUVIO_LOG_FILE 改寫日誌路徑（測試時用，避免把假事件寫進正式日誌）
 LOG_FILE_PATH = os.environ.get('ZUVIO_LOG_FILE') or os.path.join(BASE_DIR, 'zuvio_bot.log')
+# 執行期狀態（心跳檔、看門狗狀態）放在使用者本機資料夾，不放專案目錄：
+# 專案常在 OneDrive 同步資料夾裡，每 30 秒改一次檔會不停觸發同步，同步鎖檔時寫入也會失敗。
+RUNTIME_DIR = (os.environ.get('ZUVIO_RUNTIME_DIR')
+               or os.path.join(os.environ.get('LOCALAPPDATA') or BASE_DIR, 'ZuvioBot'))
+try:
+    os.makedirs(RUNTIME_DIR, exist_ok=True)
+except Exception:
+    RUNTIME_DIR = BASE_DIR
 # 心跳檔：bot 每 HEARTBEAT_INTERVAL 秒更新一次，供 deploy/watchdog.py 判斷程式是否還活著
-HEARTBEAT_FILE_PATH = os.path.join(BASE_DIR, 'zuvio_heartbeat.json')
+HEARTBEAT_FILE_PATH = os.path.join(RUNTIME_DIR, 'zuvio_heartbeat.json')
 HEARTBEAT_INTERVAL = 30
 
 URI = "https://irs.zuvio.com.tw/student5/irs/rollcall/{}"
@@ -1128,10 +1136,30 @@ class ZuvioGUI(GUI_BASE_CLASS):
                 "請執行 pip install pystray Pillow", level='warning')
 
         # --autostart（開機自動啟動用）：介面就緒後自動按「開始」；非系統匣模式則縮小到工作列
+        # 失敗會每 30 秒重試，直到監控真的跑起來（開機當下磁碟／網路常常還沒就緒）
         if self.autostart:
             if not self.tray_mode:
                 self.after(300, self.iconify)
-            self.after(1500, self.start_bot)
+            self.after(1500, self._autostart_attempt)
+
+    def report_callback_exception(self, exc, val, tb):
+        """Tk 回呼裡的例外預設只印到 stderr；以 pythonw 執行時等於消失，改記進日誌。"""
+        log("[介面錯誤] " + "".join(traceback.format_exception(exc, val, tb)).strip(), level='error')
+
+    def _autostart_attempt(self, attempt: int = 1):
+        """自動按「開始」；若因例外或設定檢查未過而沒啟動，30 秒後再試。"""
+        if self.bot_thread is not None and self.bot_thread.is_alive():
+            return
+        try:
+            self.start_bot(quiet=True)
+            started = self.bot_thread is not None and self.bot_thread.is_alive()
+        except Exception as e:
+            started = False
+            log(f"[系統] 自動開始監控失敗（第 {attempt} 次）：{short_err(e, 200)}", level='error')
+        if not started:
+            if attempt == 1:
+                log("[系統] 自動開始尚未成功，每 30 秒重試一次。", level='warning')
+            self.after(30000, lambda: self._autostart_attempt(attempt + 1))
 
     def create_widgets(self):
         # 1. 頂部狀態標題欄 (Row 0, 跨兩欄)
@@ -1338,7 +1366,13 @@ class ZuvioGUI(GUI_BASE_CLASS):
         self.bot.active_start = int(self.start_hour_var.get())
         self.bot.active_end = int(self.end_hour_var.get())
 
-    def save_settings_from_ui(self, show_alert=True) -> bool:
+    def _settings_error(self, msg: str, quiet: bool):
+        if quiet:
+            log(f"[設定錯誤] {msg}", level='error')
+        else:
+            messagebox.showerror("設定錯誤", msg)
+
+    def save_settings_from_ui(self, show_alert=True, quiet=False) -> bool:
         email = self.email_var.get().strip()
         password = self.password_var.get()  # 不 strip，保留密碼中合法的前後空白
         start_hour = int(self.start_hour_var.get())
@@ -1350,17 +1384,17 @@ class ZuvioGUI(GUI_BASE_CLASS):
         gps_str = self.gps_str_var.get().strip()
         
         if not email or not password:
-            messagebox.showerror("設定錯誤", "Zuvio 帳號與密碼為必填項目！")
+            self._settings_error("Zuvio 帳號與密碼為必填項目！", quiet)
             return False
 
         if gps_enabled:
             if not gps_str:
-                messagebox.showerror("設定錯誤", "已啟用 GPS 模擬，但未輸入 GPS 座標位置！")
+                self._settings_error("已啟用 GPS 模擬，但未輸入 GPS 座標位置！", quiet)
                 return False
             try:
                 parse_gps(gps_str)
             except ValueError as e:
-                messagebox.showerror("設定錯誤", f"GPS 座標格式無效！\n{e}")
+                self._settings_error(f"GPS 座標格式無效！\n{e}", quiet)
                 return False
             
         cfg = self.bot.load_config()
@@ -1522,9 +1556,10 @@ class ZuvioGUI(GUI_BASE_CLASS):
         except Exception as e:
             log(f"[設定] 儲存選取課程失敗: {e}", level='warning')
 
-    def start_bot(self):
+    def start_bot(self, quiet: bool = False):
         # 自動存檔，確保背景執行緒讀到最新畫面輸入（不跳出成功提示）
-        if not self.save_settings_from_ui(show_alert=False):
+        # quiet=True（自動啟動時）：設定有誤只記日誌，不彈出會卡住流程的對話框
+        if not self.save_settings_from_ui(show_alert=False, quiet=quiet):
             return
             
         self.bot.stop_event.clear()

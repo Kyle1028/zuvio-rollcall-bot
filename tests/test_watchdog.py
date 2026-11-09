@@ -36,6 +36,15 @@ check("fatal → skip", W.decide(hb(state='fatal'), now, False)[0] == 'skip')
 check("自己的 PID 判定存活", W.is_pid_alive(os.getpid()))
 check("不存在的 PID 判定不存活", not W.is_pid_alive(4_000_000_000))
 
+# 身分查不出來（PowerShell 逾時）時必須視為存活，不能誤殺
+_orig = W.is_bot_process
+W.is_bot_process = lambda pid: None
+check("身分不確定 → 視為存活（fail-open）", W.resolve_alive(os.getpid()) is True)
+W.is_bot_process = lambda pid: False
+check("確定不是 bot → 不存活", W.resolve_alive(os.getpid()) is False)
+W.is_bot_process = _orig
+check("PID 不存在 → 不存活（不呼叫身分查詢）", W.resolve_alive(4_000_000_000) is False)
+
 # bot 心跳寫入：節流、force、state
 Z.HEARTBEAT_FILE_PATH = os.path.join(tempfile.mkdtemp(), 'hb.json')
 load = lambda: json.load(open(Z.HEARTBEAT_FILE_PATH, encoding='utf-8'))  # noqa: E731
