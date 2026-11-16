@@ -7,6 +7,22 @@
 
 ---
 
+## ⚡ 一鍵安裝(建議;Oracle Linux 9 或 Ubuntu 都適用)
+
+主機開好、能 SSH 進去之後,只要:
+
+```bash
+git clone https://github.com/Kyle1028/zuvio-rollcall-bot.git ~/zuvio-rollcall-bot
+cd ~/zuvio-rollcall-bot
+bash deploy/setup_oracle_linux.sh
+sudo nano /etc/zuvio.env          # 填入 ZUVIO_USER / ZUVIO_PASS(與選填的 LINE)
+sudo systemctl enable --now zuvio
+```
+
+腳本會自動:設時區 Asia/Taipei、裝 Chromium + chromedriver + Python、建 venv、安裝 systemd 服務(開機自啟、崩潰重啟)、安裝每 5 分鐘的看門狗 timer(卡住就重啟並發 LINE)。可重複執行,不會覆蓋已有的設定。
+
+以下是逐步手動版,內容與腳本相同,供查閱或排錯。
+
 ## 0. 事前須知(先讀)
 
 - **機房 IP 可能更容易觸發 Zuvio 登入驗證碼。** 從海外機房登入,若 Zuvio 跳出 captcha,bot 無法(也不應)自動破解,會登入失敗。這點只能實測,本指南無法保證。

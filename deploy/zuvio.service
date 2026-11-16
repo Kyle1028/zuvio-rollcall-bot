@@ -6,17 +6,18 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
-# 專案實際存放路徑；若你放在別處請一併修改下面幾個路徑
-WorkingDirectory=/home/ubuntu/zuvio-rollcall-bot
-# snap 版 Chromium 在使用者目錄下需要 HOME
-Environment=HOME=/home/ubuntu
-# 讓程式用 snap 的 Chromium 與配對好的 chromedriver（非機密，直接寫在這）
-Environment=ZUVIO_CHROME_BIN=/snap/bin/chromium
-Environment=ZUVIO_CHROMEDRIVER=/snap/bin/chromium.chromedriver
+# 以下 @...@ 由 deploy/setup_oracle_linux.sh 依主機實際情況代入
+User=@USER@
+WorkingDirectory=@APP_DIR@
+Environment=HOME=@HOME@
+# 瀏覽器本體與配對的 chromedriver（Oracle Linux：EPEL chromium；Ubuntu：snap chromium）
+Environment=ZUVIO_CHROME_BIN=@CHROME_BIN@
+Environment=ZUVIO_CHROMEDRIVER=@CHROMEDRIVER@
+# 心跳檔等執行期狀態放這裡（看門狗 timer 也讀同一個位置）
+Environment=ZUVIO_RUNTIME_DIR=@RUNTIME_DIR@
 # 機密（帳密、LINE token）放這個 root-only 檔，不進專案目錄
 EnvironmentFile=/etc/zuvio.env
-ExecStart=/home/ubuntu/zuvio-rollcall-bot/.venv/bin/python /home/ubuntu/zuvio-rollcall-bot/Zuvio.py --cli
+ExecStart=@APP_DIR@/.venv/bin/python @APP_DIR@/Zuvio.py --cli
 # 崩潰自動重啟；RestartSec 設 30 秒，配合 systemd 預設限流不會被誤判為 flapping
 Restart=always
 RestartSec=30
