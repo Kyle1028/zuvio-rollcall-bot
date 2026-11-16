@@ -102,6 +102,8 @@ User=$RUN_USER
 Environment=HOME=$RUN_HOME
 Environment=ZUVIO_RUNTIME_DIR=$RUNTIME_DIR
 Environment=APP_DIR=$APP_DIR
+# 由 systemd 以 root 讀取後帶入（LINE 通知用），看門狗本身不直接讀這個檔
+EnvironmentFile=-/etc/zuvio.env
 ExecStart=/usr/bin/bash $APP_DIR/deploy/watchdog_linux.sh
 EOF
 sudo tee /etc/systemd/system/zuvio-watchdog.timer >/dev/null <<EOF

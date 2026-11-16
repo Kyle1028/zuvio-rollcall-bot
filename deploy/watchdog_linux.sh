@@ -39,11 +39,12 @@ fi
 log "心跳已 $((AGE / 60)) 分鐘未更新，重新啟動 zuvio 服務"
 sudo systemctl restart zuvio
 
-# LINE 通知（節流）：用專案 venv 的 Python 直接呼叫 Zuvio.send_line
+# LINE 通知（節流）：用專案 venv 的 Python 直接呼叫 Zuvio.send_line。
+# LINE token 由 systemd 透過 EnvironmentFile=/etc/zuvio.env 帶入環境變數（檔案是 root-only，
+# 這裡不能、也不該用 bash 去 source：密碼含 $ 或反引號時會被 shell 解讀）
 NOW=$(date +%s)
 LAST=$(cat "$STAMP" 2>/dev/null || echo 0)
 if [ $((NOW - LAST)) -ge "$NOTIFY_COOLDOWN" ]; then
-    set -a; [ -f /etc/zuvio.env ] && . /etc/zuvio.env; set +a
     (cd "$APP_DIR" && ZUVIO_LOG_FILE=/dev/null "$APP_DIR/.venv/bin/python" - "$AGE" <<'EOF'
 import sys, Zuvio as Z
 cfg = Z.ZuvioBot().load_config()
