@@ -2,8 +2,10 @@
 # ──────────────────────────────────────────────────────────────
 #  Zuvio 點名助手：Linux 主機一鍵安裝（Oracle Linux 9 / Ubuntu 22.04+，x86_64 或 aarch64）
 #
-#  在主機上、專案目錄裡執行：
-#      bash deploy/setup_oracle_linux.sh
+#  在主機上、專案目錄裡執行（建議把專案放在 /opt；SELinux 開啟的主機必須如此）：
+#      sudo mkdir -p /opt/zuvio-rollcall-bot && sudo chown "$USER": /opt/zuvio-rollcall-bot
+#      git clone https://github.com/Kyle1028/zuvio-rollcall-bot.git /opt/zuvio-rollcall-bot
+#      cd /opt/zuvio-rollcall-bot && bash deploy/setup_oracle_linux.sh
 #  做的事：設時區 → 裝 Chromium + chromedriver + Python → 建 venv → 準備 settings.json 與
 #  /etc/zuvio.env → 安裝 systemd 服務（開機自啟、崩潰重啟）→ 安裝看門狗 timer（每 5 分鐘）
 #  可重複執行（冪等）；不會覆蓋已存在的 settings.json 與 /etc/zuvio.env。
@@ -13,10 +15,27 @@ set -euo pipefail
 APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 RUN_USER="$(id -un)"
 RUN_HOME="$HOME"
-RUNTIME_DIR="$RUN_HOME/.local/state/zuvio"
+# 心跳檔等執行期狀態：放 /var/lib 而不是家目錄（服務不該依賴使用者家目錄）
+RUNTIME_DIR="/var/lib/zuvio"
 PY=""
 
 say() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
+
+selinux_enforcing() { command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" = "Enforcing" ]; }
+
+# SELinux 強制模式下，systemd 不能執行家目錄（user_home_t）裡的程式：服務會一直 203/EXEC 失敗。
+# 先檢查，避免裝了半天才發現跑不起來。
+if selinux_enforcing; then
+    case "$APP_DIR" in
+        /home/*|/root/*)
+            echo "此主機的 SELinux 為 Enforcing，systemd 無法執行家目錄裡的程式。"
+            echo "請把專案改放到 /opt 再執行本腳本："
+            echo "    sudo mkdir -p /opt/zuvio-rollcall-bot && sudo chown \"\$USER\": /opt/zuvio-rollcall-bot"
+            echo "    git clone https://github.com/Kyle1028/zuvio-rollcall-bot.git /opt/zuvio-rollcall-bot"
+            echo "    cd /opt/zuvio-rollcall-bot && bash deploy/setup_oracle_linux.sh"
+            exit 1 ;;
+    esac
+fi
 
 # ── 1. 時區 ───────────────────────────────────────────────────
 say "設定時區 Asia/Taipei"
@@ -64,9 +83,21 @@ cd "$APP_DIR"
 .venv/bin/python -m pip install -q "selenium>=4.15,<5" "webdriver-manager>=4.0,<5"
 .venv/bin/python -c "import selenium; print('selenium', selenium.__version__)"
 
+# SELinux：把 venv 的執行檔標成 bin_t，讓 systemd 能啟動它並轉換到 unconfined_service_t
+if selinux_enforcing; then
+    say "SELinux：標記 venv 執行檔為 bin_t"
+    command -v semanage >/dev/null 2>&1 || sudo dnf install -y policycoreutils-python-utils >/dev/null
+    VENV_BIN_RE="$APP_DIR/\.venv/bin(/.*)?"
+    sudo semanage fcontext -a -t bin_t "$VENV_BIN_RE" 2>/dev/null \
+        || sudo semanage fcontext -m -t bin_t "$VENV_BIN_RE"
+    sudo restorecon -R "$APP_DIR/.venv/bin"
+    ls -Z "$APP_DIR/.venv/bin/python" | awk '{print "  " $1}'
+fi
+
 # ── 4. 設定檔與機密 ───────────────────────────────────────────
 say "準備設定檔"
-mkdir -p "$RUNTIME_DIR"
+sudo mkdir -p "$RUNTIME_DIR"
+sudo chown "$RUN_USER": "$RUNTIME_DIR"
 if [ ! -f settings.json ]; then
     cp deploy/settings.server.example.json settings.json
     echo "已建立 settings.json（預設 8～18 點、監控全部課程），需要再 nano settings.json"

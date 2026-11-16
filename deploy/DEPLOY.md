@@ -12,12 +12,15 @@
 主機開好、能 SSH 進去之後,只要:
 
 ```bash
-git clone https://github.com/Kyle1028/zuvio-rollcall-bot.git ~/zuvio-rollcall-bot
-cd ~/zuvio-rollcall-bot
+sudo mkdir -p /opt/zuvio-rollcall-bot && sudo chown "$USER": /opt/zuvio-rollcall-bot
+git clone https://github.com/Kyle1028/zuvio-rollcall-bot.git /opt/zuvio-rollcall-bot
+cd /opt/zuvio-rollcall-bot
 bash deploy/setup_oracle_linux.sh
 sudo nano /etc/zuvio.env          # 填入 ZUVIO_USER / ZUVIO_PASS(與選填的 LINE)
 sudo systemctl enable --now zuvio
 ```
+
+> 專案請放在 `/opt`:Oracle Linux 預設開著 SELinux,systemd 不能執行家目錄裡的程式(服務會一直 `203/EXEC` 失敗),腳本偵測到會直接提示。
 
 腳本會自動:設時區 Asia/Taipei、裝 Chromium + chromedriver + Python、建 venv、安裝 systemd 服務(開機自啟、崩潰重啟)、安裝每 5 分鐘的看門狗 timer(卡住就重啟並發 LINE)。可重複執行,不會覆蓋已有的設定。
 

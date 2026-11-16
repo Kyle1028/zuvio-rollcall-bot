@@ -5,7 +5,7 @@
 # systemd 的 Restart=always 已處理「程序死掉」；這支補的是「程序活著但卡住」。
 set -u
 APP_DIR="${APP_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
-RUNTIME_DIR="${ZUVIO_RUNTIME_DIR:-$HOME/.local/state/zuvio}"
+RUNTIME_DIR="${ZUVIO_RUNTIME_DIR:-/var/lib/zuvio}"
 HB="$RUNTIME_DIR/zuvio_heartbeat.json"
 STAMP="$RUNTIME_DIR/watchdog_last_notify"
 STALE="${STALE:-600}"
